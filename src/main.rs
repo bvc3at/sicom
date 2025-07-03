@@ -1,13 +1,14 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use image::ImageFormat;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use thiserror::Error;
 use zip::{ZipArchive, ZipWriter};
+
+mod image;
 
 #[derive(Error, Debug)]
 pub enum SicomError {
@@ -30,7 +31,7 @@ struct ProgressLogger {
 impl ProgressLogger {
     fn new(total_files: u64) -> Self {
         let multi_progress = MultiProgress::new();
-        
+
         // Create main progress bar
         let progress_bar = multi_progress.add(ProgressBar::new(total_files));
         progress_bar.set_style(
@@ -44,11 +45,7 @@ impl ProgressLogger {
         let mut log_bars = Vec::new();
         for _ in 0..6 {
             let log_bar = multi_progress.add(ProgressBar::new(1));
-            log_bar.set_style(
-                ProgressStyle::default_bar()
-                    .template("{msg:.dim}")
-                    .unwrap()
-            );
+            log_bar.set_style(ProgressStyle::default_bar().template("{msg:.dim}").unwrap());
             log_bar.finish(); // Hide the progress part, just show message
             log_bars.push(log_bar);
         }
@@ -87,12 +84,12 @@ impl ProgressLogger {
 
     fn finish(&mut self) {
         self.progress_bar.finish();
-        
+
         // Clear all log bars
         for log_bar in &self.log_bars {
             log_bar.finish_and_clear();
         }
-        
+
         self.progress_bar.finish_and_clear();
 
         // Show any remaining logs normally
@@ -204,12 +201,17 @@ fn compress_pack(
             .with_context(|| format!("Failed to read file at index {}", i))?;
 
         let file_name = file.name().to_string();
-        let is_image = file_name.starts_with("Images/") && is_supported_image(&file_name);
+        let is_image = file_name.starts_with("Images/") && image::is_supported_image(&file_name);
 
         logger.log(format!("Processing: {}", file_name));
 
         if is_image {
-            match compress_image_file(&mut file, &file_name, image_quality) {
+            // Read image data
+            let mut image_data = Vec::new();
+            file.read_to_end(&mut image_data)
+                .with_context(|| format!("Failed to read image data: {}", file_name))?;
+
+            match image::compress_image_file(&image_data, &file_name, image_quality) {
                 Ok((compressed_data, original_size, compressed_size)) => {
                     // Add compressed image to output ZIP
                     zip_writer
@@ -291,126 +293,11 @@ fn compress_pack(
     Ok(())
 }
 
-fn is_supported_image(filename: &str) -> bool {
-    let path = Path::new(filename);
-    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-        matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png" | "webp")
-    } else {
-        false
-    }
-}
-
-fn compress_image_file(
-    file: &mut zip::read::ZipFile,
-    filename: &str,
-    quality: u8,
-) -> Result<(Vec<u8>, u64, u64)> {
-    // Read original file data
-    let mut original_data = Vec::new();
-    file.read_to_end(&mut original_data)
-        .with_context(|| format!("Failed to read image data: {}", filename))?;
-
-    let original_size = original_data.len() as u64;
-
-    // Detect image format from file extension
-    let path = Path::new(filename);
-    let format = match path.extension().and_then(|s| s.to_str()) {
-        Some(ext) => match ext.to_lowercase().as_str() {
-            "jpg" | "jpeg" => ImageFormat::Jpeg,
-            "png" => ImageFormat::Png,
-            "webp" => ImageFormat::WebP,
-            _ => return Err(anyhow!("Unsupported image format: {}", ext)),
-        },
-        None => return Err(anyhow!("No file extension found")),
-    };
-
-    // Load image
-    let img = image::load_from_memory(&original_data)
-        .with_context(|| format!("Failed to decode image: {}", filename))?;
-
-    // Compress image based on format
-    let compressed_data = match format {
-        ImageFormat::Jpeg => {
-            let mut buffer = Vec::new();
-            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buffer, quality);
-            img.write_with_encoder(encoder)
-                .with_context(|| "Failed to encode JPEG")?;
-            buffer
-        }
-        ImageFormat::Png => {
-            let mut buffer = Vec::new();
-            // Map quality to PNG compression type using image crate
-            // Higher quality = less compression (faster), lower quality = more compression (better)
-            let (compression_type, filter_type) = match quality {
-                1..=33 => (
-                    image::codecs::png::CompressionType::Best,
-                    image::codecs::png::FilterType::Adaptive,
-                ), // Low quality = maximum compression
-                34..=66 => (
-                    image::codecs::png::CompressionType::Default,
-                    image::codecs::png::FilterType::Adaptive,
-                ), // Medium quality = default compression
-                _ => (
-                    image::codecs::png::CompressionType::Fast,
-                    image::codecs::png::FilterType::Adaptive,
-                ), // High quality = minimum compression
-            };
-
-            let encoder = image::codecs::png::PngEncoder::new_with_quality(
-                &mut buffer,
-                compression_type,
-                filter_type,
-            );
-            img.write_with_encoder(encoder)
-                .with_context(|| "Failed to encode PNG")?;
-            buffer
-        }
-        ImageFormat::WebP => {
-            let mut buffer = Vec::new();
-
-            // Use webp crate directly for quality control
-            let width = img.width();
-            let height = img.height();
-            let rgba_img = img.to_rgba8();
-
-            if quality >= 95 {
-                // Use lossless for high quality
-                let encoder = webp::Encoder::new(&rgba_img, webp::PixelLayout::Rgba, width, height);
-                let encoded = encoder.encode_lossless();
-                buffer.extend_from_slice(&encoded);
-            } else {
-                // Use lossy compression with quality parameter
-                let encoder = webp::Encoder::new(&rgba_img, webp::PixelLayout::Rgba, width, height);
-                let encoded = encoder.encode(quality as f32);
-                buffer.extend_from_slice(&encoded);
-            }
-            buffer
-        }
-        _ => return Err(anyhow!("Unsupported format for compression")),
-    };
-
-    let compressed_size = compressed_data.len() as u64;
-    Ok((compressed_data, original_size, compressed_size))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
-
-    #[test]
-    fn test_is_supported_image() {
-        assert!(is_supported_image("Images/test.jpg"));
-        assert!(is_supported_image("Images/test.jpeg"));
-        assert!(is_supported_image("Images/test.png"));
-        assert!(is_supported_image("Images/test.webp"));
-        assert!(is_supported_image("Images/test.JPG"));
-        assert!(!is_supported_image("Images/test.gif"));
-        assert!(!is_supported_image("Images/test.bmp"));
-        assert!(!is_supported_image("Audio/test.mp3"));
-        assert!(!is_supported_image("content.xml"));
-    }
 
     #[test]
     fn test_output_path_generation() {
