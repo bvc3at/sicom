@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use image::ImageFormat;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -15,6 +17,89 @@ pub enum SicomError {
     InvalidSiqFile(PathBuf),
     #[error("Failed to process image {name}: {source}")]
     ImageProcessingError { name: String, source: anyhow::Error },
+}
+
+struct ProgressLogger {
+    _multi_progress: MultiProgress, // Keep alive but prefix with _ to suppress warning
+    progress_bar: ProgressBar,
+    log_bars: Vec<ProgressBar>,
+    log_lines: VecDeque<String>,
+    max_lines: usize,
+}
+
+impl ProgressLogger {
+    fn new(total_files: u64) -> Self {
+        let multi_progress = MultiProgress::new();
+        
+        // Create main progress bar
+        let progress_bar = multi_progress.add(ProgressBar::new(total_files));
+        progress_bar.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} files (ETA: {eta})")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+
+        // Create 6 log lines as progress bars without progress (just for text display)
+        let mut log_bars = Vec::new();
+        for _ in 0..6 {
+            let log_bar = multi_progress.add(ProgressBar::new(1));
+            log_bar.set_style(
+                ProgressStyle::default_bar()
+                    .template("{msg:.dim}")
+                    .unwrap()
+            );
+            log_bar.finish(); // Hide the progress part, just show message
+            log_bars.push(log_bar);
+        }
+
+        Self {
+            _multi_progress: multi_progress,
+            progress_bar,
+            log_bars,
+            log_lines: VecDeque::new(),
+            max_lines: 6,
+        }
+    }
+
+    fn log(&mut self, message: String) {
+        // Add new log line
+        self.log_lines.push_back(message);
+
+        // Remove old lines if we exceed the limit
+        while self.log_lines.len() > self.max_lines {
+            self.log_lines.pop_front();
+        }
+
+        // Update the log display bars
+        for (i, log_bar) in self.log_bars.iter().enumerate() {
+            if let Some(line) = self.log_lines.get(i) {
+                log_bar.set_message(line.clone());
+            } else {
+                log_bar.set_message("".to_string());
+            }
+        }
+    }
+
+    fn inc(&mut self) {
+        self.progress_bar.inc(1);
+    }
+
+    fn finish(&mut self) {
+        self.progress_bar.finish();
+        
+        // Clear all log bars
+        for log_bar in &self.log_bars {
+            log_bar.finish_and_clear();
+        }
+        
+        self.progress_bar.finish_and_clear();
+
+        // Show any remaining logs normally
+        for line in &self.log_lines {
+            println!("{}", line);
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -108,6 +193,10 @@ fn compress_pack(
     let mut total_original_size = 0u64;
     let mut total_compressed_size = 0u64;
 
+    // Initialize progress logger
+    let total_files = archive.len() as u64;
+    let mut logger = ProgressLogger::new(total_files);
+
     // Process each file in the archive
     for i in 0..archive.len() {
         let mut file = archive
@@ -117,7 +206,7 @@ fn compress_pack(
         let file_name = file.name().to_string();
         let is_image = file_name.starts_with("Images/") && is_supported_image(&file_name);
 
-        println!("Processing: {}", file_name);
+        logger.log(format!("Processing: {}", file_name));
 
         if is_image {
             match compress_image_file(&mut file, &file_name, image_quality) {
@@ -136,15 +225,15 @@ fn compress_pack(
                     total_original_size += original_size;
                     total_compressed_size += compressed_size;
 
-                    println!(
+                    logger.log(format!(
                         "  Compressed: {} bytes -> {} bytes ({:.1}% reduction)",
                         original_size,
                         compressed_size,
                         (1.0 - compressed_size as f64 / original_size as f64) * 100.0
-                    );
+                    ));
                 }
                 Err(e) => {
-                    eprintln!("  Skipping {}: {}", file_name, e);
+                    logger.log(format!("  Skipping {}: {}", file_name, e));
                     skipped_images += 1;
 
                     // Copy original file unchanged
@@ -175,11 +264,17 @@ fn compress_pack(
                 .write_all(&buffer)
                 .with_context(|| format!("Failed to write file: {}", file_name))?;
         }
+
+        // Increment progress after processing each file
+        logger.inc();
     }
 
     zip_writer
         .finish()
         .with_context(|| "Failed to finalize output ZIP")?;
+
+    // Finish progress logging and show final summary
+    logger.finish();
 
     println!("\nCompression complete!");
     println!("Images processed: {}", processed_images);
@@ -247,15 +342,24 @@ fn compress_image_file(
             // Map quality to PNG compression type using image crate
             // Higher quality = less compression (faster), lower quality = more compression (better)
             let (compression_type, filter_type) = match quality {
-                1..=33 => (image::codecs::png::CompressionType::Best, image::codecs::png::FilterType::Adaptive),    // Low quality = maximum compression
-                34..=66 => (image::codecs::png::CompressionType::Default, image::codecs::png::FilterType::Adaptive), // Medium quality = default compression
-                _ => (image::codecs::png::CompressionType::Fast, image::codecs::png::FilterType::Adaptive),         // High quality = minimum compression
+                1..=33 => (
+                    image::codecs::png::CompressionType::Best,
+                    image::codecs::png::FilterType::Adaptive,
+                ), // Low quality = maximum compression
+                34..=66 => (
+                    image::codecs::png::CompressionType::Default,
+                    image::codecs::png::FilterType::Adaptive,
+                ), // Medium quality = default compression
+                _ => (
+                    image::codecs::png::CompressionType::Fast,
+                    image::codecs::png::FilterType::Adaptive,
+                ), // High quality = minimum compression
             };
-            
+
             let encoder = image::codecs::png::PngEncoder::new_with_quality(
-                &mut buffer, 
-                compression_type, 
-                filter_type
+                &mut buffer,
+                compression_type,
+                filter_type,
             );
             img.write_with_encoder(encoder)
                 .with_context(|| "Failed to encode PNG")?;
