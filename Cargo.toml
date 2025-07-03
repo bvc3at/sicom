@@ -9,6 +9,7 @@ anyhow = "1.0"
 thiserror = "1.0"
 zip = "0.6"
 image = { version = "0.25", features = ["jpeg", "png", "webp"] }
+webp = "0.3"
 
 [dev-dependencies]
 tempfile = "3.0"
