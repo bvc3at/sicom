@@ -122,6 +122,32 @@ enum Commands {
     },
 }
 
+fn is_supported_video(filename: &str) -> bool {
+    let path = std::path::Path::new(filename);
+    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+        matches!(ext.to_lowercase().as_str(), "mp4" | "avi" | "mov" | "mkv" | "wmv" | "webm")
+    } else {
+        false
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit_index = 0;
+    
+    while size >= 1024.0 && unit_index < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit_index += 1;
+    }
+    
+    if unit_index == 0 {
+        format!("{} {}", bytes, UNITS[unit_index])
+    } else {
+        format!("{:.1} {}", size, UNITS[unit_index])
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -186,10 +212,20 @@ fn compress_pack(
         .with_context(|| format!("Failed to create output file: {:?}", output_path))?;
     let mut zip_writer = ZipWriter::new(BufWriter::new(output_file));
 
+    // Statistics tracking
     let mut processed_images = 0;
     let mut skipped_images = 0;
-    let mut total_original_size = 0u64;
-    let mut total_compressed_size = 0u64;
+    let processed_audio = 0;  // Not used yet - audio compression temporarily disabled
+    let mut skipped_audio = 0;
+    let _processed_video = 0;  // Not used yet, video compression not implemented
+    let mut skipped_video = 0;
+    
+    let mut image_original_size = 0u64;
+    let mut image_compressed_size = 0u64;
+    let mut audio_original_size = 0u64;
+    let audio_compressed_size = 0u64;  // Not used yet - audio compression temporarily disabled
+    let mut video_original_size = 0u64;
+    let _video_compressed_size = 0u64;  // Not used yet, video compression not implemented
     
     // Track image conversions for content.xml updates
     let mut image_conversions: HashMap<String, String> = HashMap::new();
@@ -208,6 +244,7 @@ fn compress_pack(
         let file_name = file.name().to_string();
         let is_image = file_name.starts_with("Images/") && image::is_supported_image(&file_name);
         let is_audio = file_name.starts_with("Audio/") && audio::is_supported_audio(&file_name);
+        let is_video = file_name.starts_with("Video/") && is_supported_video(&file_name);
         let is_content_xml = file_name == "content.xml";
 
         logger.log(format!("Processing: {}", file_name));
@@ -246,8 +283,8 @@ fn compress_pack(
                     image_conversions.insert(file_name.clone(), webp_filename.clone());
 
                     processed_images += 1;
-                    total_original_size += original_size;
-                    total_compressed_size += compressed_size;
+                    image_original_size += original_size;
+                    image_compressed_size += compressed_size;
 
                     logger.log(format!(
                         "  Converted to WebP: {} bytes -> {} bytes ({:.1}% reduction)",
@@ -279,46 +316,45 @@ fn compress_pack(
             file.read_to_end(&mut audio_data)
                 .with_context(|| format!("Failed to read audio data: {}", file_name))?;
             
-            match audio::compress_audio_file(&audio_data, &file_name, image_quality) {
-                Ok((compressed_data, original_size, compressed_size)) => {
-                    // Add compressed audio to output ZIP
-                    zip_writer
-                        .start_file(&file_name, zip::write::FileOptions::default())
-                        .with_context(|| {
-                            format!("Failed to start file in output ZIP: {}", file_name)
-                        })?;
-                    zip_writer.write_all(&compressed_data).with_context(|| {
-                        format!("Failed to write compressed audio: {}", file_name)
-                    })?;
+            // Temporarily skip audio compression to test logging system - just copy unchanged
+            logger.log(format!("  Skipping audio compression (testing): {}", file_name));
+            skipped_audio += 1;
+            
+            // Track original size for skipped audio
+            audio_original_size += audio_data.len() as u64;
 
-                    processed_images += 1; // TODO: Track audio separately
-                    total_original_size += original_size;
-                    total_compressed_size += compressed_size;
-
-                    logger.log(format!(
-                        "  Compressed: {} bytes -> {} bytes ({:.1}% reduction)",
-                        original_size,
-                        compressed_size,
-                        (1.0 - compressed_size as f64 / original_size as f64) * 100.0
-                    ));
-                }
-                Err(e) => {
-                    logger.log(format!("  Skipping {}: {}", file_name, e));
-                    skipped_images += 1; // TODO: Track audio separately
-
-                    // Copy original file unchanged
-                    zip_writer
-                        .start_file(&file_name, zip::write::FileOptions::default())
-                        .with_context(|| {
-                            format!("Failed to start file in output ZIP: {}", file_name)
-                        })?;
-                    zip_writer
-                        .write_all(&audio_data)
-                        .with_context(|| format!("Failed to write original audio file: {}", file_name))?;
-                }
-            }
+            // Copy original file unchanged
+            zip_writer
+                .start_file(&file_name, zip::write::FileOptions::default())
+                .with_context(|| {
+                    format!("Failed to start file in output ZIP: {}", file_name)
+                })?;
+            zip_writer
+                .write_all(&audio_data)
+                .with_context(|| format!("Failed to write original audio file: {}", file_name))?;
+        } else if is_video {
+            // Read video data
+            let mut video_data = Vec::new();
+            file.read_to_end(&mut video_data)
+                .with_context(|| format!("Failed to read video data: {}", file_name))?;
+            
+            // For now, just copy video files unchanged (future: add video compression)
+            zip_writer
+                .start_file(&file_name, zip::write::FileOptions::default())
+                .with_context(|| {
+                    format!("Failed to start file in output ZIP: {}", file_name)
+                })?;
+            zip_writer
+                .write_all(&video_data)
+                .with_context(|| format!("Failed to write video file: {}", file_name))?;
+            
+            // Track as skipped for now (no compression implemented yet)
+            skipped_video += 1;
+            video_original_size += video_data.len() as u64;
+            
+            logger.log(format!("  Copied unchanged (no compression): {} bytes", format_size(video_data.len() as u64)));
         } else {
-            // Copy non-image files unchanged
+            // Copy other files unchanged
             let mut buffer = Vec::new();
             file.read_to_end(&mut buffer)
                 .with_context(|| format!("Failed to read file: {}", file_name))?;
@@ -423,15 +459,52 @@ fn compress_pack(
     logger.finish();
 
     println!("\nCompression complete!");
-    println!("Images processed: {}", processed_images);
-    println!("Images skipped: {}", skipped_images);
-    if total_original_size > 0 {
-        println!(
-            "Total image size reduction: {} bytes -> {} bytes ({:.1}% reduction)",
-            total_original_size,
-            total_compressed_size,
-            (1.0 - total_compressed_size as f64 / total_original_size as f64) * 100.0
+    
+    // Images statistics
+    println!("\nImages:");
+    println!("  Processed: {}", processed_images);
+    println!("  Skipped: {}", skipped_images);
+    if image_original_size > 0 {
+        println!("  Size reduction: {} -> {} ({:.1}% reduction)",
+            format_size(image_original_size),
+            format_size(image_compressed_size),
+            (1.0 - image_compressed_size as f64 / image_original_size as f64) * 100.0
         );
+    }
+    
+    // Audio statistics
+    println!("\nAudio:");
+    println!("  Processed: {}", processed_audio);
+    println!("  Skipped: {}", skipped_audio);
+    if audio_original_size > 0 {
+        if audio_compressed_size > 0 {
+            println!("  Size reduction: {} -> {} ({:.1}% reduction)",
+                format_size(audio_original_size),
+                format_size(audio_compressed_size),
+                (1.0 - audio_compressed_size as f64 / audio_original_size as f64) * 100.0
+            );
+        } else {
+            println!("  Total size: {} (no compression applied)", format_size(audio_original_size));
+        }
+    }
+    
+    // Video statistics
+    println!("\nVideo:");
+    println!("  Processed: {}", _processed_video);
+    println!("  Skipped: {}", skipped_video);
+    if video_original_size > 0 {
+        println!("  Total size: {} (no compression implemented yet)", format_size(video_original_size));
+    }
+    
+    // Overall statistics
+    let total_original = image_original_size + audio_original_size + video_original_size;
+    let total_compressed = image_compressed_size + audio_compressed_size + video_original_size; // video not compressed yet
+    
+    if total_original > 0 {
+        println!("\nOverall:");
+        println!("  Total original size: {}", format_size(total_original));
+        println!("  Total compressed size: {}", format_size(total_compressed));
+        println!("  Total reduction: {:.1}%", (1.0 - total_compressed as f64 / total_original as f64) * 100.0);
     }
 
     Ok(())
