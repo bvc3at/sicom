@@ -9,6 +9,7 @@ use thiserror::Error;
 use zip::{ZipArchive, ZipWriter};
 
 mod image;
+mod audio;
 
 #[derive(Error, Debug)]
 pub enum SicomError {
@@ -202,6 +203,7 @@ fn compress_pack(
 
         let file_name = file.name().to_string();
         let is_image = file_name.starts_with("Images/") && image::is_supported_image(&file_name);
+        let is_audio = file_name.starts_with("Audio/") && audio::is_supported_audio(&file_name);
 
         logger.log(format!("Processing: {}", file_name));
 
@@ -251,6 +253,50 @@ fn compress_pack(
                     zip_writer
                         .write_all(&buffer)
                         .with_context(|| format!("Failed to write original file: {}", file_name))?;
+                }
+            }
+        } else if is_audio {
+            // Read audio data
+            let mut audio_data = Vec::new();
+            file.read_to_end(&mut audio_data)
+                .with_context(|| format!("Failed to read audio data: {}", file_name))?;
+            
+            match audio::compress_audio_file(&audio_data, &file_name, image_quality) {
+                Ok((compressed_data, original_size, compressed_size)) => {
+                    // Add compressed audio to output ZIP
+                    zip_writer
+                        .start_file(&file_name, zip::write::FileOptions::default())
+                        .with_context(|| {
+                            format!("Failed to start file in output ZIP: {}", file_name)
+                        })?;
+                    zip_writer.write_all(&compressed_data).with_context(|| {
+                        format!("Failed to write compressed audio: {}", file_name)
+                    })?;
+
+                    processed_images += 1; // TODO: Track audio separately
+                    total_original_size += original_size;
+                    total_compressed_size += compressed_size;
+
+                    logger.log(format!(
+                        "  Compressed: {} bytes -> {} bytes ({:.1}% reduction)",
+                        original_size,
+                        compressed_size,
+                        (1.0 - compressed_size as f64 / original_size as f64) * 100.0
+                    ));
+                }
+                Err(e) => {
+                    logger.log(format!("  Skipping {}: {}", file_name, e));
+                    skipped_images += 1; // TODO: Track audio separately
+
+                    // Copy original file unchanged
+                    zip_writer
+                        .start_file(&file_name, zip::write::FileOptions::default())
+                        .with_context(|| {
+                            format!("Failed to start file in output ZIP: {}", file_name)
+                        })?;
+                    zip_writer
+                        .write_all(&audio_data)
+                        .with_context(|| format!("Failed to write original audio file: {}", file_name))?;
                 }
             }
         } else {
