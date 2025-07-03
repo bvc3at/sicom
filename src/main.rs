@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use std::collections::VecDeque;
+use std::collections::{VecDeque, HashMap};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
@@ -190,6 +190,10 @@ fn compress_pack(
     let mut skipped_images = 0;
     let mut total_original_size = 0u64;
     let mut total_compressed_size = 0u64;
+    
+    // Track image conversions for content.xml updates
+    let mut image_conversions: HashMap<String, String> = HashMap::new();
+    let mut content_xml_data: Option<String> = None;
 
     // Initialize progress logger
     let total_files = archive.len() as u64;
@@ -204,10 +208,20 @@ fn compress_pack(
         let file_name = file.name().to_string();
         let is_image = file_name.starts_with("Images/") && image::is_supported_image(&file_name);
         let is_audio = file_name.starts_with("Audio/") && audio::is_supported_audio(&file_name);
+        let is_content_xml = file_name == "content.xml";
 
         logger.log(format!("Processing: {}", file_name));
 
-        if is_image {
+        if is_content_xml {
+            // Read content.xml for later processing
+            let mut xml_data = String::new();
+            file.read_to_string(&mut xml_data)
+                .with_context(|| "Failed to read content.xml as UTF-8")?;
+            content_xml_data = Some(xml_data);
+            
+            // We'll write content.xml after processing all images
+            logger.log("  Stored content.xml for path updates".to_string());
+        } else if is_image {
             // Read image data
             let mut image_data = Vec::new();
             file.read_to_end(&mut image_data)
@@ -215,22 +229,28 @@ fn compress_pack(
 
             match image::compress_image_file(&image_data, &file_name, image_quality) {
                 Ok((compressed_data, original_size, compressed_size)) => {
-                    // Add compressed image to output ZIP
+                    // Convert to WebP filename
+                    let webp_filename = image::to_webp_filename(&file_name);
+                    
+                    // Add compressed image to output ZIP with WebP extension
                     zip_writer
-                        .start_file(&file_name, zip::write::FileOptions::default())
+                        .start_file(&webp_filename, zip::write::FileOptions::default())
                         .with_context(|| {
-                            format!("Failed to start file in output ZIP: {}", file_name)
+                            format!("Failed to start file in output ZIP: {}", webp_filename)
                         })?;
                     zip_writer.write_all(&compressed_data).with_context(|| {
-                        format!("Failed to write compressed image: {}", file_name)
+                        format!("Failed to write compressed image: {}", webp_filename)
                     })?;
+
+                    // Track the conversion for content.xml updates
+                    image_conversions.insert(file_name.clone(), webp_filename.clone());
 
                     processed_images += 1;
                     total_original_size += original_size;
                     total_compressed_size += compressed_size;
 
                     logger.log(format!(
-                        "  Compressed: {} bytes -> {} bytes ({:.1}% reduction)",
+                        "  Converted to WebP: {} bytes -> {} bytes ({:.1}% reduction)",
                         original_size,
                         compressed_size,
                         (1.0 - compressed_size as f64 / original_size as f64) * 100.0
@@ -240,19 +260,17 @@ fn compress_pack(
                     logger.log(format!("  Skipping {}: {}", file_name, e));
                     skipped_images += 1;
 
-                    // Copy original file unchanged
-                    let mut buffer = Vec::new();
-                    file.read_to_end(&mut buffer)
-                        .with_context(|| format!("Failed to read original file: {}", file_name))?;
-
+                    // Copy original file unchanged (keep original extension)
                     zip_writer
                         .start_file(&file_name, zip::write::FileOptions::default())
                         .with_context(|| {
                             format!("Failed to start file in output ZIP: {}", file_name)
                         })?;
                     zip_writer
-                        .write_all(&buffer)
+                        .write_all(&image_data)
                         .with_context(|| format!("Failed to write original file: {}", file_name))?;
+                    
+                    // Do NOT track this conversion - content.xml will keep original path
                 }
             }
         } else if is_audio {
@@ -315,6 +333,86 @@ fn compress_pack(
 
         // Increment progress after processing each file
         logger.inc();
+    }
+
+    // Process content.xml with updated image paths
+    if let Some(mut xml_content) = content_xml_data {
+        logger.log("Updating content.xml with new image paths".to_string());
+        
+        let mut total_updated_refs = 0;
+        
+        // Update image paths in content.xml
+        for (original_path, webp_path) in &image_conversions {
+            // Extract just the filename from the full path for the XML replacement
+            let original_filename = original_path.strip_prefix("Images/").unwrap_or(original_path);
+            let webp_filename = webp_path.strip_prefix("Images/").unwrap_or(webp_path);
+            
+            // Try different encoding variations of the filename
+            let original_variations = vec![
+                original_filename.to_string(),
+                urlencoding::decode(original_filename).unwrap_or_else(|_| original_filename.into()).to_string(),
+                urlencoding::encode(original_filename).to_string(),
+            ];
+            
+            let webp_variations = vec![
+                webp_filename.to_string(),
+                urlencoding::decode(webp_filename).unwrap_or_else(|_| webp_filename.into()).to_string(),
+                urlencoding::encode(webp_filename).to_string(),
+            ];
+            
+            let mut file_replacements = 0;
+            
+            // Try all combinations of original and webp variations
+            for orig_var in &original_variations {
+                for webp_var in &webp_variations {
+                    // Try different XML patterns that might contain the filename
+                    let patterns = vec![
+                        // Simple filename reference
+                        (orig_var.clone(), webp_var.clone()),
+                        // With isRef="True" wrapper
+                        (format!("isRef=\"True\">{}", orig_var), format!("isRef=\"True\">{}", webp_var)),
+                        // With type="image" attribute
+                        (format!("type=\"image\" isRef=\"True\">{}", orig_var), format!("type=\"image\" isRef=\"True\">{}", webp_var)),
+                        // With different quote styles
+                        (format!("isRef='True'>{}", orig_var), format!("isRef='True'>{}", webp_var)),
+                        // Full path references
+                        (format!("Images/{}", orig_var), format!("Images/{}", webp_var)),
+                        // Path references with isRef
+                        (format!("isRef=\"True\">Images/{}", orig_var), format!("isRef=\"True\">Images/{}", webp_var)),
+                    ];
+                    
+                    for (old_pattern, new_pattern) in patterns {
+                        if old_pattern != new_pattern {
+                            let count = xml_content.matches(&old_pattern).count();
+                            if count > 0 {
+                                xml_content = xml_content.replace(&old_pattern, &new_pattern);
+                                file_replacements += count;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            total_updated_refs += file_replacements;
+            
+            if file_replacements > 0 {
+                logger.log(format!("  Updated: {} -> {} ({} refs)", original_filename, webp_filename, file_replacements));
+            } else {
+                logger.log(format!("  Warning: No refs found for {}", original_filename));
+            }
+        }
+        
+        // Write updated content.xml to output ZIP
+        zip_writer
+            .start_file("content.xml", zip::write::FileOptions::default())
+            .with_context(|| "Failed to start content.xml in output ZIP")?;
+        zip_writer
+            .write_all(xml_content.as_bytes())
+            .with_context(|| "Failed to write updated content.xml")?;
+            
+        logger.log(format!("Updated {} image references in content.xml", total_updated_refs));
+    } else {
+        logger.log("Warning: No content.xml found in pack".to_string());
     }
 
     zip_writer

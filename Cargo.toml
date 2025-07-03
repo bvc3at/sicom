@@ -13,6 +13,7 @@ webp = "0.3"
 indicatif = "0.17"
 mp3lame-encoder = "0.1"
 symphonia = { version = "0.5", features = ["all"] }
+urlencoding = "2.1"
 
 [dev-dependencies]
 tempfile = "3.0"
