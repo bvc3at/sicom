@@ -119,6 +119,9 @@ enum Commands {
 
         #[arg(long, default_value = "85", help = "Image quality (1-100)")]
         image_quality: u8,
+
+        #[arg(long, default_value = "85", help = "Audio quality (1-100)")]
+        audio_quality: u8,
     },
 }
 
@@ -156,8 +159,9 @@ fn main() -> Result<()> {
             input_pack,
             output_pack,
             image_quality,
+            audio_quality,
         } => {
-            compress_pack(input_pack, output_pack, image_quality)?;
+            compress_pack(input_pack, output_pack, image_quality, audio_quality)?;
         }
     }
 
@@ -168,6 +172,7 @@ fn compress_pack(
     input_pack: PathBuf,
     output_pack: Option<PathBuf>,
     image_quality: u8,
+    audio_quality: u8,
 ) -> Result<()> {
     // Validate input
     if !input_pack.exists() {
@@ -195,10 +200,14 @@ fn compress_pack(
     println!("Compressing pack: {:?}", input_pack);
     println!("Output to: {:?}", output_path);
     println!("Image quality: {}", image_quality);
+    println!("Audio quality: {}", audio_quality);
 
     // Validate quality
     if !(1..=100).contains(&image_quality) {
         return Err(anyhow!("Image quality must be between 1 and 100"));
+    }
+    if !(1..=100).contains(&audio_quality) {
+        return Err(anyhow!("Audio quality must be between 1 and 100"));
     }
 
     // Open input ZIP
@@ -215,7 +224,7 @@ fn compress_pack(
     // Statistics tracking
     let mut processed_images = 0;
     let mut skipped_images = 0;
-    let processed_audio = 0;  // Not used yet - audio compression temporarily disabled
+    let mut processed_audio = 0;
     let mut skipped_audio = 0;
     let _processed_video = 0;  // Not used yet, video compression not implemented
     let mut skipped_video = 0;
@@ -223,7 +232,7 @@ fn compress_pack(
     let mut image_original_size = 0u64;
     let mut image_compressed_size = 0u64;
     let mut audio_original_size = 0u64;
-    let audio_compressed_size = 0u64;  // Not used yet - audio compression temporarily disabled
+    let mut audio_compressed_size = 0u64;
     let mut video_original_size = 0u64;
     let _video_compressed_size = 0u64;  // Not used yet, video compression not implemented
     
@@ -333,24 +342,51 @@ fn compress_pack(
             // Track input size
             total_input_size += audio_data.len() as u64;
             
-            // Temporarily skip audio compression to test logging system - just copy unchanged
-            logger.log(format!("  Skipping audio compression (testing): {}", file_name));
-            skipped_audio += 1;
-            
-            // Track original size for skipped audio
-            audio_original_size += audio_data.len() as u64;
+            // Try to compress audio
+            match audio::compress_audio_file(&audio_data, &file_name, audio_quality) {
+                Ok((compressed_data, original_size, compressed_size)) => {
+                    // Add compressed audio to output ZIP
+                    zip_writer
+                        .start_file(&file_name, zip::write::FileOptions::default())
+                        .with_context(|| {
+                            format!("Failed to start file in output ZIP: {}", file_name)
+                        })?;
+                    zip_writer.write_all(&compressed_data).with_context(|| {
+                        format!("Failed to write compressed audio: {}", file_name)
+                    })?;
 
-            // Copy original file unchanged
-            zip_writer
-                .start_file(&file_name, zip::write::FileOptions::default())
-                .with_context(|| {
-                    format!("Failed to start file in output ZIP: {}", file_name)
-                })?;
-            zip_writer
-                .write_all(&audio_data)
-                .with_context(|| format!("Failed to write original audio file: {}", file_name))?;
-            
-            total_output_size += audio_data.len() as u64;
+                    processed_audio += 1;
+                    audio_original_size += original_size;
+                    audio_compressed_size += compressed_size;
+                    total_output_size += compressed_size;
+
+                    logger.log(format!(
+                        "  MP3 compressed: {} bytes -> {} bytes ({:.1}% reduction)",
+                        original_size,
+                        compressed_size,
+                        (1.0 - compressed_size as f64 / original_size as f64) * 100.0
+                    ));
+                }
+                Err(e) => {
+                    logger.log(format!("  Skipping {}: {}", file_name, e));
+                    skipped_audio += 1;
+                    
+                    // Track original size for skipped audio
+                    audio_original_size += audio_data.len() as u64;
+
+                    // Copy original file unchanged
+                    zip_writer
+                        .start_file(&file_name, zip::write::FileOptions::default())
+                        .with_context(|| {
+                            format!("Failed to start file in output ZIP: {}", file_name)
+                        })?;
+                    zip_writer
+                        .write_all(&audio_data)
+                        .with_context(|| format!("Failed to write original audio file: {}", file_name))?;
+                    
+                    total_output_size += audio_data.len() as u64;
+                }
+            }
         } else if is_video {
             // Read video data
             let mut video_data = Vec::new();
@@ -569,7 +605,7 @@ mod tests {
 
     #[test]
     fn test_invalid_input_validation() {
-        let result = compress_pack(PathBuf::from("nonexistent.siq"), None, 85);
+        let result = compress_pack(PathBuf::from("nonexistent.siq"), None, 85, 85);
         assert!(result.is_err());
 
         // Create a temporary file without .siq extension
@@ -577,7 +613,7 @@ mod tests {
         temp_file.write_all(b"test").unwrap();
         let temp_path = temp_file.path().to_path_buf();
 
-        let result = compress_pack(temp_path, None, 85);
+        let result = compress_pack(temp_path, None, 85, 85);
         assert!(result.is_err());
     }
 
@@ -586,14 +622,20 @@ mod tests {
         // Quality should be between 1 and 100
         let temp_siq = create_temp_siq_file();
 
-        let result = compress_pack(temp_siq.clone(), None, 0);
+        let result = compress_pack(temp_siq.clone(), None, 0, 85);
         assert!(result.is_err());
 
-        let result = compress_pack(temp_siq.clone(), None, 101);
+        let result = compress_pack(temp_siq.clone(), None, 101, 85);
+        assert!(result.is_err());
+
+        let result = compress_pack(temp_siq.clone(), None, 85, 0);
+        assert!(result.is_err());
+
+        let result = compress_pack(temp_siq.clone(), None, 85, 101);
         assert!(result.is_err());
 
         // Valid quality should work (though will fail due to invalid ZIP content)
-        let result = compress_pack(temp_siq, None, 50);
+        let result = compress_pack(temp_siq, None, 50, 75);
         // This will fail at ZIP reading stage, but quality validation should pass
         assert!(result.is_err());
         assert!(
