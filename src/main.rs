@@ -227,6 +227,10 @@ fn compress_pack(
     let mut video_original_size = 0u64;
     let _video_compressed_size = 0u64;  // Not used yet, video compression not implemented
     
+    // Track total file sizes (for overall statistics)
+    let mut total_input_size = 0u64;
+    let mut total_output_size = 0u64;
+    
     // Track image conversions for content.xml updates
     let mut image_conversions: HashMap<String, String> = HashMap::new();
     let mut content_xml_data: Option<String> = None;
@@ -254,6 +258,10 @@ fn compress_pack(
             let mut xml_data = String::new();
             file.read_to_string(&mut xml_data)
                 .with_context(|| "Failed to read content.xml as UTF-8")?;
+            
+            // Track input size
+            total_input_size += xml_data.len() as u64;
+            
             content_xml_data = Some(xml_data);
             
             // We'll write content.xml after processing all images
@@ -263,6 +271,9 @@ fn compress_pack(
             let mut image_data = Vec::new();
             file.read_to_end(&mut image_data)
                 .with_context(|| format!("Failed to read image data: {}", file_name))?;
+
+            // Track input size
+            total_input_size += image_data.len() as u64;
 
             match image::compress_image_file(&image_data, &file_name, image_quality) {
                 Ok((compressed_data, original_size, compressed_size)) => {
@@ -285,6 +296,7 @@ fn compress_pack(
                     processed_images += 1;
                     image_original_size += original_size;
                     image_compressed_size += compressed_size;
+                    total_output_size += compressed_size;
 
                     logger.log(format!(
                         "  Converted to WebP: {} bytes -> {} bytes ({:.1}% reduction)",
@@ -307,6 +319,8 @@ fn compress_pack(
                         .write_all(&image_data)
                         .with_context(|| format!("Failed to write original file: {}", file_name))?;
                     
+                    total_output_size += image_data.len() as u64;
+                    
                     // Do NOT track this conversion - content.xml will keep original path
                 }
             }
@@ -315,6 +329,9 @@ fn compress_pack(
             let mut audio_data = Vec::new();
             file.read_to_end(&mut audio_data)
                 .with_context(|| format!("Failed to read audio data: {}", file_name))?;
+            
+            // Track input size
+            total_input_size += audio_data.len() as u64;
             
             // Temporarily skip audio compression to test logging system - just copy unchanged
             logger.log(format!("  Skipping audio compression (testing): {}", file_name));
@@ -332,11 +349,16 @@ fn compress_pack(
             zip_writer
                 .write_all(&audio_data)
                 .with_context(|| format!("Failed to write original audio file: {}", file_name))?;
+            
+            total_output_size += audio_data.len() as u64;
         } else if is_video {
             // Read video data
             let mut video_data = Vec::new();
             file.read_to_end(&mut video_data)
                 .with_context(|| format!("Failed to read video data: {}", file_name))?;
+            
+            // Track input size
+            total_input_size += video_data.len() as u64;
             
             // For now, just copy video files unchanged (future: add video compression)
             zip_writer
@@ -351,6 +373,7 @@ fn compress_pack(
             // Track as skipped for now (no compression implemented yet)
             skipped_video += 1;
             video_original_size += video_data.len() as u64;
+            total_output_size += video_data.len() as u64;
             
             logger.log(format!("  Copied unchanged (no compression): {} bytes", format_size(video_data.len() as u64)));
         } else {
@@ -359,12 +382,17 @@ fn compress_pack(
             file.read_to_end(&mut buffer)
                 .with_context(|| format!("Failed to read file: {}", file_name))?;
 
+            // Track input size
+            total_input_size += buffer.len() as u64;
+
             zip_writer
                 .start_file(&file_name, zip::write::FileOptions::default())
                 .with_context(|| format!("Failed to start file in output ZIP: {}", file_name))?;
             zip_writer
                 .write_all(&buffer)
                 .with_context(|| format!("Failed to write file: {}", file_name))?;
+            
+            total_output_size += buffer.len() as u64;
         }
 
         // Increment progress after processing each file
@@ -446,6 +474,9 @@ fn compress_pack(
             .write_all(xml_content.as_bytes())
             .with_context(|| "Failed to write updated content.xml")?;
             
+        // Track output size
+        total_output_size += xml_content.len() as u64;
+            
         logger.log(format!("Updated {} image references in content.xml", total_updated_refs));
     } else {
         logger.log("Warning: No content.xml found in pack".to_string());
@@ -497,14 +528,21 @@ fn compress_pack(
     }
     
     // Overall statistics
-    let total_original = image_original_size + audio_original_size + video_original_size;
-    let total_compressed = image_compressed_size + audio_compressed_size + video_original_size; // video not compressed yet
-    
-    if total_original > 0 {
+    if total_input_size > 0 {
         println!("\nOverall:");
-        println!("  Total original size: {}", format_size(total_original));
-        println!("  Total compressed size: {}", format_size(total_compressed));
-        println!("  Total reduction: {:.1}%", (1.0 - total_compressed as f64 / total_original as f64) * 100.0);
+        println!("  Total original size: {}", format_size(total_input_size));
+        println!("  Total compressed size: {}", format_size(total_output_size));
+        println!("  Total reduction: {:.1}%", (1.0 - total_output_size as f64 / total_input_size as f64) * 100.0);
+        
+        // Show actual filesystem sizes for verification
+        if let Ok(input_metadata) = std::fs::metadata(&input_pack) {
+            let input_file_size = input_metadata.len();
+            println!("  Input file size: {} (filesystem)", format_size(input_file_size));
+        }
+        if let Ok(output_metadata) = std::fs::metadata(&output_path) {
+            let output_file_size = output_metadata.len();
+            println!("  Output file size: {} (filesystem)", format_size(output_file_size));
+        }
     }
 
     Ok(())
