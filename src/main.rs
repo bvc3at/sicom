@@ -10,6 +10,7 @@ use zip::{ZipArchive, ZipWriter};
 
 mod image;
 mod audio;
+mod video;
 
 #[derive(Error, Debug)]
 pub enum SicomError {
@@ -122,17 +123,18 @@ enum Commands {
 
         #[arg(long, default_value = "85", help = "Audio quality (1-100)")]
         audio_quality: u8,
+
+        #[arg(long, default_value = "75", help = "Video quality (1-100)")]
+        video_quality: u8,
+
+        #[arg(long, help = "Skip video compression")]
+        skip_video: bool,
+
+        #[arg(long, help = "Path to ffmpeg binary (optional, auto-detected if not provided)")]
+        ffmpeg_path: Option<PathBuf>,
     },
 }
 
-fn is_supported_video(filename: &str) -> bool {
-    let path = std::path::Path::new(filename);
-    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-        matches!(ext.to_lowercase().as_str(), "mp4" | "avi" | "mov" | "mkv" | "wmv" | "webm")
-    } else {
-        false
-    }
-}
 
 fn format_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
@@ -160,8 +162,11 @@ fn main() -> Result<()> {
             output_pack,
             image_quality,
             audio_quality,
+            video_quality,
+            skip_video,
+            ffmpeg_path,
         } => {
-            compress_pack(input_pack, output_pack, image_quality, audio_quality)?;
+            compress_pack(input_pack, output_pack, image_quality, audio_quality, video_quality, skip_video, ffmpeg_path)?;
         }
     }
 
@@ -173,6 +178,9 @@ fn compress_pack(
     output_pack: Option<PathBuf>,
     image_quality: u8,
     audio_quality: u8,
+    video_quality: u8,
+    skip_video: bool,
+    ffmpeg_path: Option<PathBuf>,
 ) -> Result<()> {
     // Validate input
     if !input_pack.exists() {
@@ -201,6 +209,38 @@ fn compress_pack(
     println!("Output to: {:?}", output_path);
     println!("Image quality: {}", image_quality);
     println!("Audio quality: {}", audio_quality);
+    println!("Video quality: {}", video_quality);
+    println!("Skip video: {}", skip_video);
+
+    // Detect or validate ffmpeg path
+    let ffmpeg_available = if let Some(path) = &ffmpeg_path {
+        if path.exists() {
+            println!("Using ffmpeg at: {:?}", path);
+            true
+        } else {
+            println!("Warning: Specified ffmpeg path does not exist: {:?}", path);
+            false
+        }
+    } else {
+        // Auto-detect ffmpeg using 'which' command
+        match std::process::Command::new("which").arg("ffmpeg").output() {
+            Ok(output) if output.status.success() => {
+                let ffmpeg_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                println!("Auto-detected ffmpeg at: {}", ffmpeg_path);
+                true
+            }
+            _ => {
+                if !skip_video {
+                    println!("Warning: ffmpeg not found in PATH. Video compression will be skipped.");
+                    println!("To enable video compression:");
+                    println!("  1. Install ffmpeg: brew install ffmpeg (macOS) or apt install ffmpeg (Ubuntu)");
+                    println!("  2. Or specify path with --ffmpeg-path");
+                    println!("  3. Or use --skip-video to suppress this warning");
+                }
+                false
+            }
+        }
+    };
 
     // Validate quality
     if !(1..=100).contains(&image_quality) {
@@ -208,6 +248,9 @@ fn compress_pack(
     }
     if !(1..=100).contains(&audio_quality) {
         return Err(anyhow!("Audio quality must be between 1 and 100"));
+    }
+    if !(1..=100).contains(&video_quality) {
+        return Err(anyhow!("Video quality must be between 1 and 100"));
     }
 
     // Open input ZIP
@@ -226,7 +269,7 @@ fn compress_pack(
     let mut skipped_images = 0;
     let mut processed_audio = 0;
     let mut skipped_audio = 0;
-    let _processed_video = 0;  // Not used yet, video compression not implemented
+    let mut processed_video = 0;
     let mut skipped_video = 0;
     
     let mut image_original_size = 0u64;
@@ -234,7 +277,7 @@ fn compress_pack(
     let mut audio_original_size = 0u64;
     let mut audio_compressed_size = 0u64;
     let mut video_original_size = 0u64;
-    let _video_compressed_size = 0u64;  // Not used yet, video compression not implemented
+    let mut video_compressed_size = 0u64;
     
     // Track total file sizes (for overall statistics)
     let mut total_input_size = 0u64;
@@ -257,7 +300,7 @@ fn compress_pack(
         let file_name = file.name().to_string();
         let is_image = file_name.starts_with("Images/") && image::is_supported_image(&file_name);
         let is_audio = file_name.starts_with("Audio/") && audio::is_supported_audio(&file_name);
-        let is_video = file_name.starts_with("Video/") && is_supported_video(&file_name);
+        let is_video = file_name.starts_with("Video/") && video::is_supported_video(&file_name);
         let is_content_xml = file_name == "content.xml";
 
         logger.log(format!("Processing: {}", file_name));
@@ -396,22 +439,70 @@ fn compress_pack(
             // Track input size
             total_input_size += video_data.len() as u64;
             
-            // For now, just copy video files unchanged (future: add video compression)
-            zip_writer
-                .start_file(&file_name, zip::write::FileOptions::default())
-                .with_context(|| {
-                    format!("Failed to start file in output ZIP: {}", file_name)
-                })?;
-            zip_writer
-                .write_all(&video_data)
-                .with_context(|| format!("Failed to write video file: {}", file_name))?;
-            
-            // Track as skipped for now (no compression implemented yet)
-            skipped_video += 1;
-            video_original_size += video_data.len() as u64;
-            total_output_size += video_data.len() as u64;
-            
-            logger.log(format!("  Copied unchanged (no compression): {} bytes", format_size(video_data.len() as u64)));
+            if skip_video || !ffmpeg_available {
+                let reason = if skip_video { "skip_video flag" } else { "ffmpeg not available" };
+                logger.log(format!("  Skipping video compression ({}): {}", reason, file_name));
+                skipped_video += 1;
+                video_original_size += video_data.len() as u64;
+
+                // Copy original file unchanged
+                zip_writer
+                    .start_file(&file_name, zip::write::FileOptions::default())
+                    .with_context(|| {
+                        format!("Failed to start file in output ZIP: {}", file_name)
+                    })?;
+                zip_writer
+                    .write_all(&video_data)
+                    .with_context(|| format!("Failed to write original video file: {}", file_name))?;
+                
+                total_output_size += video_data.len() as u64;
+            } else {
+                // Try to compress video using ffmpeg-sidecar
+                match video::compress_video_file(&video_data, &file_name, video_quality, ffmpeg_path.as_deref()) {
+                    Ok((compressed_data, original_size, compressed_size)) => {
+                        // Add compressed video to output ZIP
+                        zip_writer
+                            .start_file(&file_name, zip::write::FileOptions::default())
+                            .with_context(|| {
+                                format!("Failed to start file in output ZIP: {}", file_name)
+                            })?;
+                        zip_writer.write_all(&compressed_data).with_context(|| {
+                            format!("Failed to write compressed video: {}", file_name)
+                        })?;
+
+                        processed_video += 1;
+                        video_original_size += original_size;
+                        video_compressed_size += compressed_size;
+                        total_output_size += compressed_size;
+
+                        logger.log(format!(
+                            "  HEVC compressed: {} -> {} ({:.1}% reduction)",
+                            format_size(original_size),
+                            format_size(compressed_size),
+                            (1.0 - compressed_size as f64 / original_size as f64) * 100.0
+                        ));
+                    }
+                    Err(e) => {
+                        logger.log(format!("  Video compression failed for {}: {}", file_name, e));
+                        skipped_video += 1;
+                        
+                        // Track original size for skipped video
+                        video_original_size += video_data.len() as u64;
+
+                        // Copy original file unchanged
+                        zip_writer
+                            .start_file(&file_name, zip::write::FileOptions::default())
+                            .with_context(|| {
+                                format!("Failed to start file in output ZIP: {}", file_name)
+                            })?;
+                        zip_writer
+                            .write_all(&video_data)
+                            .with_context(|| format!("Failed to write original video file: {}", file_name))?;
+                        
+                        total_output_size += video_data.len() as u64;
+                    }
+                }
+            }
         } else {
             // Copy other files unchanged
             let mut buffer = Vec::new();
@@ -557,10 +648,18 @@ fn compress_pack(
     
     // Video statistics
     println!("\nVideo:");
-    println!("  Processed: {}", _processed_video);
+    println!("  Processed: {}", processed_video);
     println!("  Skipped: {}", skipped_video);
     if video_original_size > 0 {
-        println!("  Total size: {} (no compression implemented yet)", format_size(video_original_size));
+        if video_compressed_size > 0 {
+            println!("  Size reduction: {} -> {} ({:.1}% reduction)",
+                format_size(video_original_size),
+                format_size(video_compressed_size),
+                (1.0 - video_compressed_size as f64 / video_original_size as f64) * 100.0
+            );
+        } else {
+            println!("  Total size: {} (no compression applied)", format_size(video_original_size));
+        }
     }
     
     // Overall statistics
@@ -605,7 +704,7 @@ mod tests {
 
     #[test]
     fn test_invalid_input_validation() {
-        let result = compress_pack(PathBuf::from("nonexistent.siq"), None, 85, 85);
+        let result = compress_pack(PathBuf::from("nonexistent.siq"), None, 85, 85, 75, false, None);
         assert!(result.is_err());
 
         // Create a temporary file without .siq extension
@@ -613,7 +712,7 @@ mod tests {
         temp_file.write_all(b"test").unwrap();
         let temp_path = temp_file.path().to_path_buf();
 
-        let result = compress_pack(temp_path, None, 85, 85);
+        let result = compress_pack(temp_path, None, 85, 85, 75, false, None);
         assert!(result.is_err());
     }
 
@@ -622,20 +721,26 @@ mod tests {
         // Quality should be between 1 and 100
         let temp_siq = create_temp_siq_file();
 
-        let result = compress_pack(temp_siq.clone(), None, 0, 85);
+        let result = compress_pack(temp_siq.clone(), None, 0, 85, 75, false, None);
         assert!(result.is_err());
 
-        let result = compress_pack(temp_siq.clone(), None, 101, 85);
+        let result = compress_pack(temp_siq.clone(), None, 101, 85, 75, false, None);
         assert!(result.is_err());
 
-        let result = compress_pack(temp_siq.clone(), None, 85, 0);
+        let result = compress_pack(temp_siq.clone(), None, 85, 0, 75, false, None);
         assert!(result.is_err());
 
-        let result = compress_pack(temp_siq.clone(), None, 85, 101);
+        let result = compress_pack(temp_siq.clone(), None, 85, 101, 75, false, None);
+        assert!(result.is_err());
+
+        let result = compress_pack(temp_siq.clone(), None, 85, 85, 0, false, None);
+        assert!(result.is_err());
+
+        let result = compress_pack(temp_siq.clone(), None, 85, 85, 101, false, None);
         assert!(result.is_err());
 
         // Valid quality should work (though will fail due to invalid ZIP content)
-        let result = compress_pack(temp_siq, None, 50, 75);
+        let result = compress_pack(temp_siq, None, 50, 75, 60, false, None);
         // This will fail at ZIP reading stage, but quality validation should pass
         assert!(result.is_err());
         assert!(
