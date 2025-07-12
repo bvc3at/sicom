@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use log::{info, warn, error, debug};
 use std::collections::{VecDeque, HashMap};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -130,11 +131,28 @@ enum Commands {
         #[arg(long, help = "Skip video compression")]
         skip_video: bool,
 
+        #[arg(long, help = "Skip image compression")]
+        skip_image: bool,
+
+        #[arg(long, help = "Skip audio compression")]
+        skip_audio: bool,
+
         #[arg(long, help = "Path to ffmpeg binary (optional, auto-detected if not provided)")]
         ffmpeg_path: Option<PathBuf>,
+
+        #[arg(long, help = "Always use compressed file even if it's larger than original")]
+        always_compress: bool,
     },
 }
 
+/// Check if compressed data should be used based on size comparison
+fn should_use_compressed(original_size: u64, compressed_size: u64, always_compress: bool) -> bool {
+    if always_compress {
+        true
+    } else {
+        compressed_size < original_size
+    }
+}
 
 fn format_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
@@ -154,6 +172,19 @@ fn format_size(bytes: u64) -> String {
 }
 
 fn main() -> Result<()> {
+    // Initialize logger with default level set to info, using stderr to not interfere with progress bar
+    let mut builder = env_logger::Builder::new();
+    builder.target(env_logger::Target::Stderr);
+    
+    // Set default to info level if RUST_LOG is not set
+    if std::env::var("RUST_LOG").is_err() {
+        builder.filter_level(log::LevelFilter::Info);
+    } else {
+        builder.parse_default_env();
+    }
+    
+    builder.init();
+    
     let cli = Cli::parse();
 
     match cli.command {
@@ -163,10 +194,13 @@ fn main() -> Result<()> {
             image_quality,
             audio_quality,
             video_quality,
+            skip_image,
+            skip_audio,
             skip_video,
             ffmpeg_path,
+            always_compress,
         } => {
-            compress_pack(input_pack, output_pack, image_quality, audio_quality, video_quality, skip_video, ffmpeg_path)?;
+            compress_pack(input_pack, output_pack, image_quality, audio_quality, video_quality, skip_image, skip_audio, skip_video, ffmpeg_path, always_compress)?;
         }
     }
 
@@ -179,8 +213,11 @@ fn compress_pack(
     image_quality: u8,
     audio_quality: u8,
     video_quality: u8,
+    skip_image: bool,
+    skip_audio: bool,
     skip_video: bool,
     ffmpeg_path: Option<PathBuf>,
+    always_compress: bool,
 ) -> Result<()> {
     // Validate input
     if !input_pack.exists() {
@@ -205,20 +242,22 @@ fn compress_pack(
         }
     };
 
-    println!("Compressing pack: {:?}", input_pack);
-    println!("Output to: {:?}", output_path);
-    println!("Image quality: {}", image_quality);
-    println!("Audio quality: {}", audio_quality);
-    println!("Video quality: {}", video_quality);
-    println!("Skip video: {}", skip_video);
+    info!("Compressing pack: {:?}", input_pack);
+    info!("Output to: {:?}", output_path);
+    info!("Image quality: {}", image_quality);
+    info!("Audio quality: {}", audio_quality);
+    info!("Video quality: {}", video_quality);
+    info!("Skip image: {}", skip_image);
+    info!("Skip audio: {}", skip_audio);
+    info!("Skip video: {}", skip_video);
 
     // Detect or validate ffmpeg path
     let ffmpeg_available = if let Some(path) = &ffmpeg_path {
         if path.exists() {
-            println!("Using ffmpeg at: {:?}", path);
+            info!("Using ffmpeg at: {:?}", path);
             true
         } else {
-            println!("Warning: Specified ffmpeg path does not exist: {:?}", path);
+            warn!("Specified ffmpeg path does not exist: {:?}", path);
             false
         }
     } else {
@@ -226,16 +265,16 @@ fn compress_pack(
         match std::process::Command::new("which").arg("ffmpeg").output() {
             Ok(output) if output.status.success() => {
                 let ffmpeg_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                println!("Auto-detected ffmpeg at: {}", ffmpeg_path);
+                info!("Auto-detected ffmpeg at: {}", ffmpeg_path);
                 true
             }
             _ => {
                 if !skip_video {
-                    println!("Warning: ffmpeg not found in PATH. Video compression will be skipped.");
-                    println!("To enable video compression:");
-                    println!("  1. Install ffmpeg: brew install ffmpeg (macOS) or apt install ffmpeg (Ubuntu)");
-                    println!("  2. Or specify path with --ffmpeg-path");
-                    println!("  3. Or use --skip-video to suppress this warning");
+                    warn!("ffmpeg not found in PATH. Video compression will be skipped.");
+                    info!("To enable video compression:");
+                    info!("  1. Install ffmpeg: brew install ffmpeg (macOS) or apt install ffmpeg (Ubuntu)");
+                    info!("  2. Or specify path with --ffmpeg-path");
+                    info!("  3. Or use --skip-video to suppress this warning");
                 }
                 false
             }
@@ -267,10 +306,13 @@ fn compress_pack(
     // Statistics tracking
     let mut processed_images = 0;
     let mut skipped_images = 0;
+    let mut kept_original_images = 0; // Images kept original due to size
     let mut processed_audio = 0;
     let mut skipped_audio = 0;
+    let mut kept_original_audio = 0; // Audio kept original due to size
     let mut processed_video = 0;
     let mut skipped_video = 0;
+    let mut kept_original_video = 0; // Video kept original due to size
     
     let mut image_original_size = 0u64;
     let mut image_compressed_size = 0u64;
@@ -290,6 +332,10 @@ fn compress_pack(
     // Initialize progress logger
     let total_files = archive.len() as u64;
     let mut logger = ProgressLogger::new(total_files);
+    
+    // Temporarily raise log level during progress display to suppress verbose audio library logs
+    // This prevents Symphonia INFO logs from interfering with the progress bar
+    log::set_max_level(log::LevelFilter::Warn);
 
     // Process each file in the archive
     for i in 0..archive.len() {
@@ -459,7 +505,11 @@ fn compress_pack(
             } else {
                 // Try to compress video using ffmpeg-sidecar
                 match video::compress_video_file(&video_data, &file_name, video_quality, ffmpeg_path.as_deref()) {
-                    Ok((compressed_data, original_size, compressed_size)) => {
+                    Ok((compressed_data, original_size, compressed_size, log_messages)) => {
+                        // Display ffmpeg logs in the progress logger
+                        for log_msg in log_messages {
+                            logger.log(log_msg);
+                        }
                         // Add compressed video to output ZIP
                         zip_writer
                             .start_file(&file_name, zip::write::FileOptions::default())
@@ -615,8 +665,11 @@ fn compress_pack(
 
     // Finish progress logging and show final summary
     logger.finish();
+    
+    // Restore original log level for final summary
+    log::set_max_level(log::LevelFilter::Info);
 
-    println!("\nCompression complete!");
+    info!("Compression complete!");
     
     // Images statistics
     println!("\nImages:");

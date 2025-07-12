@@ -5,6 +5,19 @@ use std::fs;
 use tempfile::NamedTempFile;
 use std::io::Write;
 
+/// Clean control characters from log messages that can interfere with progress bars
+fn clean_log_message(message: &str) -> String {
+    message
+        .chars()
+        .filter(|&c| {
+            // Keep printable ASCII and spaces, filter out control characters
+            c.is_ascii_graphic() || c == ' '
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 /// Supported video formats
 #[derive(Debug, PartialEq)]
 pub enum VideoFormat {
@@ -56,12 +69,13 @@ fn quality_to_crf(quality: u8) -> u8 {
 }
 
 /// Compress video file using HEVC (H.265) encoding via ffmpeg-sidecar
+/// Returns (compressed_data, original_size, compressed_size, log_messages)
 pub fn compress_video_file(
     data: &[u8],
     filename: &str,
     quality: u8,
     ffmpeg_path: Option<&Path>,
-) -> Result<(Vec<u8>, u64, u64)> {
+) -> Result<(Vec<u8>, u64, u64, Vec<String>)> {
     let original_size = data.len() as u64;
     
     // Detect video format
@@ -92,10 +106,12 @@ pub fn compress_video_file(
         FfmpegCommand::new()
     };
     
-    // Configure ffmpeg command for HEVC encoding using raw args for better control
+    // Configure ffmpeg command for HEVC encoding
     ffmpeg_cmd
         .input(input_path.to_string_lossy())
         .args([
+            "-nostats",               // Disable progress output with carriage returns
+            "-hide_banner",           // Hide banner for cleaner output
             "-c:v", "libx265",       // Use HEVC/H.265 encoder
             "-crf", &crf.to_string(), // Quality setting
             "-preset", "medium",      // Encoding speed vs compression trade-off
@@ -105,19 +121,39 @@ pub fn compress_video_file(
         ])
         .output(output_path.to_string_lossy());
     
-    
-    
-    // Execute ffmpeg command and wait for completion
-    let mut ffmpeg_process = ffmpeg_cmd
+    // Execute with event iteration to capture logs
+    let iter = ffmpeg_cmd
         .spawn()
-        .context("Failed to spawn ffmpeg process")?;
+        .context("Failed to spawn ffmpeg process")?
+        .iter()
+        .context("Failed to get ffmpeg iterator")?;
     
-    // Wait for the process to complete
-    let exit_status = ffmpeg_process.wait().context("Failed to wait for ffmpeg process")?;
+    let mut log_messages = Vec::new();
     
-    // Check if ffmpeg completed successfully
-    if !exit_status.success() {
-        return Err(anyhow!("FFmpeg process failed with exit code: {:?}", exit_status.code()));
+    for event in iter {
+        match event {
+            ffmpeg_sidecar::event::FfmpegEvent::Progress(_) => {
+                // Progress events can be ignored for now
+            }
+            ffmpeg_sidecar::event::FfmpegEvent::Log(level, line) => {
+                // Clean the log line and collect for progress logger
+                let clean_line = clean_log_message(&line);
+                if !clean_line.is_empty() {
+                    let log_msg = format!("  FFmpeg {:?}: {}", level, clean_line);
+                    log_messages.push(log_msg);
+                }
+            }
+            ffmpeg_sidecar::event::FfmpegEvent::Done => {
+                // Process completed successfully
+                break;
+            }
+            ffmpeg_sidecar::event::FfmpegEvent::Error(e) => {
+                return Err(anyhow!("FFmpeg error: {}", e));
+            }
+            _ => {
+                // Ignore other events
+            }
+        }
     }
     
     // Read compressed data from output file
@@ -130,7 +166,7 @@ pub fn compress_video_file(
     drop(output_temp);
     
     
-    Ok((compressed_data, original_size, compressed_size))
+    Ok((compressed_data, original_size, compressed_size, log_messages))
 }
 
 #[cfg(test)]
