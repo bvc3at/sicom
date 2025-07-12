@@ -5,18 +5,6 @@ use std::fs;
 use tempfile::NamedTempFile;
 use std::io::Write;
 
-/// Clean control characters from log messages that can interfere with progress bars
-fn clean_log_message(message: &str) -> String {
-    message
-        .chars()
-        .filter(|&c| {
-            // Keep printable ASCII and spaces, filter out control characters
-            c.is_ascii_graphic() || c == ' '
-        })
-        .collect::<String>()
-        .trim()
-        .to_string()
-}
 
 /// Supported video formats
 #[derive(Debug, PartialEq)]
@@ -89,6 +77,11 @@ pub fn compress_video_file(
         .context("Failed to write input data to temporary file")?;
     input_temp.flush()
         .context("Failed to flush input data to temporary file")?;
+    
+    // Ensure file is fully written and synced
+    input_temp.as_file().sync_all()
+        .context("Failed to sync input data to disk")?;
+    
     let input_path = input_temp.path();
     
     let output_temp = NamedTempFile::with_suffix(".mp4")
@@ -112,6 +105,7 @@ pub fn compress_video_file(
         .args([
             "-nostats",               // Disable progress output with carriage returns
             "-hide_banner",           // Hide banner for cleaner output
+            // Let FFmpeg auto-detect input format instead of forcing mp4
             "-c:v", "libx265",       // Use HEVC/H.265 encoder
             "-crf", &crf.to_string(), // Quality setting
             "-preset", "medium",      // Encoding speed vs compression trade-off
@@ -121,40 +115,22 @@ pub fn compress_video_file(
         ])
         .output(output_path.to_string_lossy());
     
-    // Execute with event iteration to capture logs
-    let iter = ffmpeg_cmd
+    
+    // Execute FFmpeg and capture result
+    // Note: For now, using simple execution approach since event iteration was causing hangs
+    // TODO: Investigate ffmpeg-sidecar event iteration issues in the future
+    let result = ffmpeg_cmd
         .spawn()
         .context("Failed to spawn ffmpeg process")?
-        .iter()
-        .context("Failed to get ffmpeg iterator")?;
+        .wait()
+        .context("Failed to wait for ffmpeg process")?;
     
-    let mut log_messages = Vec::new();
-    
-    for event in iter {
-        match event {
-            ffmpeg_sidecar::event::FfmpegEvent::Progress(_) => {
-                // Progress events can be ignored for now
-            }
-            ffmpeg_sidecar::event::FfmpegEvent::Log(level, line) => {
-                // Clean the log line and collect for progress logger
-                let clean_line = clean_log_message(&line);
-                if !clean_line.is_empty() {
-                    let log_msg = format!("  FFmpeg {:?}: {}", level, clean_line);
-                    log_messages.push(log_msg);
-                }
-            }
-            ffmpeg_sidecar::event::FfmpegEvent::Done => {
-                // Process completed successfully
-                break;
-            }
-            ffmpeg_sidecar::event::FfmpegEvent::Error(e) => {
-                return Err(anyhow!("FFmpeg error: {}", e));
-            }
-            _ => {
-                // Ignore other events
-            }
-        }
+    if !result.success() {
+        return Err(anyhow!("FFmpeg execution failed with exit code: {:?}", result.code()));
     }
+    
+    // For now, provide a simple log message since event capture was problematic
+    let log_messages = vec!["HEVC video compression completed".to_string()];
     
     // Read compressed data from output file
     let compressed_data = fs::read(output_path)

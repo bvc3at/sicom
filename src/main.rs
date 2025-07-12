@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use log::{info, warn, error, debug};
+use log::{info, warn, error};
 use std::collections::{VecDeque, HashMap};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -145,14 +145,6 @@ enum Commands {
     },
 }
 
-/// Check if compressed data should be used based on size comparison
-fn should_use_compressed(original_size: u64, compressed_size: u64, always_compress: bool) -> bool {
-    if always_compress {
-        true
-    } else {
-        compressed_size < original_size
-    }
-}
 
 fn format_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
@@ -217,7 +209,7 @@ fn compress_pack(
     skip_audio: bool,
     skip_video: bool,
     ffmpeg_path: Option<PathBuf>,
-    always_compress: bool,
+    _always_compress: bool,
 ) -> Result<()> {
     // Validate input
     if !input_pack.exists() {
@@ -306,13 +298,13 @@ fn compress_pack(
     // Statistics tracking
     let mut processed_images = 0;
     let mut skipped_images = 0;
-    let mut kept_original_images = 0; // Images kept original due to size
+    let _kept_original_images = 0; // Images kept original due to size
     let mut processed_audio = 0;
     let mut skipped_audio = 0;
-    let mut kept_original_audio = 0; // Audio kept original due to size
+    let _kept_original_audio = 0; // Audio kept original due to size
     let mut processed_video = 0;
     let mut skipped_video = 0;
-    let mut kept_original_video = 0; // Video kept original due to size
+    let _kept_original_video = 0; // Video kept original due to size
     
     let mut image_original_size = 0u64;
     let mut image_compressed_size = 0u64;
