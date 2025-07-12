@@ -164,9 +164,33 @@ fn format_size(bytes: u64) -> String {
 }
 
 fn main() -> Result<()> {
-    // Initialize logger with default level set to info, using stderr to not interfere with progress bar
+    // Initialize logger with custom grey time format, using stderr to not interfere with progress bar
     let mut builder = env_logger::Builder::new();
     builder.target(env_logger::Target::Stderr);
+    
+    // Custom formatter to show only grey time on the left
+    builder.format(|buf, record| {
+        use std::io::Write;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        
+        // Get current local time
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        // Convert to local time (simple UTC offset approximation)
+        let local_offset = 0; // Using UTC for simplicity, could be enhanced with timezone detection
+        let local_time = now + local_offset;
+        
+        // Extract hours, minutes, seconds
+        let hours = (local_time / 3600) % 24;
+        let minutes = (local_time / 60) % 60;
+        let seconds = local_time % 60;
+        
+        // Format with grey color: \x1b[90m for grey, \x1b[0m to reset
+        writeln!(buf, "\x1b[90m{:02}:{:02}:{:02}\x1b[0m {}", hours, minutes, seconds, record.args())
+    });
     
     // Set default to info level if RUST_LOG is not set
     if std::env::var("RUST_LOG").is_err() {
