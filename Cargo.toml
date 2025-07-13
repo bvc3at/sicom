@@ -2,6 +2,10 @@
 name = "sicom"
 version = "0.1.0"
 edition = "2024"
+description = "SIGame pack compression utility for reducing .siq file sizes"
+license = "MIT"
+keywords = ["sigame", "compression", "zip", "media", "cli"]
+categories = ["command-line-utilities", "multimedia", "compression"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

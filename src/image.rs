@@ -3,11 +3,9 @@ use std::path::Path;
 
 pub fn is_supported_image(filename: &str) -> bool {
     let path = Path::new(filename);
-    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+    path.extension().and_then(|s| s.to_str()).is_some_and(|ext| {
         matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png" | "webp")
-    } else {
-        false
-    }
+    })
 }
 
 pub fn compress_image_file(
@@ -19,7 +17,7 @@ pub fn compress_image_file(
 
     // Load image (detect format from data, not extension)
     let img = image::load_from_memory(data)
-        .with_context(|| format!("Failed to decode image: {}", filename))?;
+        .with_context(|| format!("Failed to decode image: {filename}"))?;
 
     // Always convert to WebP format for maximum compression
     let compressed_data = {
@@ -30,16 +28,15 @@ pub fn compress_image_file(
         let height = img.height();
         let rgba_img = img.to_rgba8();
 
+        let webp_encoder = webp::Encoder::new(&rgba_img, webp::PixelLayout::Rgba, width, height);
         if quality >= 95 {
             // Use lossless for high quality
-            let encoder = webp::Encoder::new(&rgba_img, webp::PixelLayout::Rgba, width, height);
-            let encoded = encoder.encode_lossless();
-            buffer.extend_from_slice(&encoded);
+            let encoded_data = webp_encoder.encode_lossless();
+            buffer.extend_from_slice(&encoded_data);
         } else {
             // Use lossy compression with quality parameter
-            let encoder = webp::Encoder::new(&rgba_img, webp::PixelLayout::Rgba, width, height);
-            let encoded = encoder.encode(quality as f32);
-            buffer.extend_from_slice(&encoded);
+            let encoded_data = webp_encoder.encode(f32::from(quality));
+            buffer.extend_from_slice(&encoded_data);
         }
         buffer
     };
@@ -51,21 +48,16 @@ pub fn compress_image_file(
 /// Convert image filename to WebP extension
 pub fn to_webp_filename(filename: &str) -> String {
     let path = Path::new(filename);
-    match path.file_stem().and_then(|s| s.to_str()) {
-        Some(stem) => {
-            if let Some(parent) = path.parent() {
-                if parent == Path::new("") {
-                    // Handle case where there's no directory
-                    format!("{}.webp", stem)
-                } else {
-                    format!("{}/{}.webp", parent.display(), stem)
-                }
+    path.file_stem().and_then(|s| s.to_str()).map_or_else(|| filename.to_string(), |stem| {
+        path.parent().map_or_else(|| format!("{stem}.webp"), |parent| {
+            if parent == Path::new("") {
+                // Handle case where there's no directory
+                format!("{stem}.webp")
             } else {
-                format!("{}.webp", stem)
+                format!("{}/{}.webp", parent.display(), stem)
             }
-        }
-        None => filename.to_string(), // Fallback to original if we can't parse
-    }
+        })
+    })
 }
 
 #[cfg(test)]
@@ -92,14 +84,20 @@ mod tests {
         assert_eq!(to_webp_filename("Images/test.jpeg"), "Images/test.webp");
         assert_eq!(to_webp_filename("Images/test.png"), "Images/test.webp");
         assert_eq!(to_webp_filename("Images/test.webp"), "Images/test.webp");
-        
+
         // Test with UTF-8 characters (like in the sample pack)
-        assert_eq!(to_webp_filename("Images/КимЧенИр. Северная Корея.jpg"), "Images/КимЧенИр. Северная Корея.webp");
-        assert_eq!(to_webp_filename("Images/ВДНХ.Москва~2.jpg"), "Images/ВДНХ.Москва~2.webp");
-        
+        assert_eq!(
+            to_webp_filename("Images/КимЧенИр. Северная Корея.jpg"),
+            "Images/КимЧенИр. Северная Корея.webp"
+        );
+        assert_eq!(
+            to_webp_filename("Images/ВДНХ.Москва~2.jpg"),
+            "Images/ВДНХ.Москва~2.webp"
+        );
+
         // Test without directory
         assert_eq!(to_webp_filename("test.jpg"), "test.webp");
-        
+
         // Test edge cases
         assert_eq!(to_webp_filename("test"), "test.webp");
     }

@@ -1,13 +1,12 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use ffmpeg_sidecar::command::FfmpegCommand;
-use std::path::Path;
 use std::fs;
-use tempfile::NamedTempFile;
 use std::io::Write;
-
+use std::path::Path;
+use tempfile::NamedTempFile;
 
 /// Supported video formats
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum VideoFormat {
     Mp4,
     Mov,
@@ -19,17 +18,18 @@ pub enum VideoFormat {
 /// Check if a video file format is supported
 pub fn is_supported_video(filename: &str) -> bool {
     let path = Path::new(filename);
-    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-        matches!(ext.to_lowercase().as_str(), "mp4" | "mov" | "avi" | "mkv" | "wmv" | "webm")
-    } else {
-        false
-    }
+    path.extension().and_then(|s| s.to_str()).is_some_and(|ext| {
+        matches!(
+            ext.to_lowercase().as_str(),
+            "mp4" | "mov" | "avi" | "mkv" | "wmv" | "webm"
+        )
+    })
 }
 
 /// Detect video format from file extension
 fn detect_video_format(filename: &str) -> Option<VideoFormat> {
     let path = Path::new(filename);
-    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+    path.extension().and_then(|s| s.to_str()).and_then(|ext| {
         match ext.to_lowercase().as_str() {
             "mp4" => Some(VideoFormat::Mp4),
             "mov" => Some(VideoFormat::Mov),
@@ -37,9 +37,7 @@ fn detect_video_format(filename: &str) -> Option<VideoFormat> {
             "mkv" => Some(VideoFormat::Mkv),
             _ => None,
         }
-    } else {
-        None
-    }
+    })
 }
 
 /// Map quality (1-100) to x265 CRF value (0-51)
@@ -48,16 +46,19 @@ fn detect_video_format(filename: &str) -> Option<VideoFormat> {
 fn quality_to_crf(quality: u8) -> u8 {
     // Ensure quality is in valid range
     let quality = quality.clamp(1, 100);
-    
+
     // Map quality 1-100 to CRF 51-18
     // Quality 1   → CRF 51 (lowest quality, smallest size)
     // Quality 50  → CRF 28 (balanced)
     // Quality 100 → CRF 18 (high quality, larger size)
-    51 - ((quality as f32 - 1.0) * 33.0 / 99.0) as u8
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        51 - ((f32::from(quality) - 1.0) * 33.0 / 99.0) as u8
+    }
 }
 
 /// Compress video file using HEVC (H.265) encoding via ffmpeg-sidecar
-/// Returns (compressed_data, original_size, compressed_size, log_messages)
+/// Returns (`compressed_data`, `original_size`, `compressed_size`, `log_messages`)
 pub fn compress_video_file(
     data: &[u8],
     filename: &str,
@@ -65,57 +66,60 @@ pub fn compress_video_file(
     ffmpeg_path: Option<&Path>,
 ) -> Result<(Vec<u8>, u64, u64, Vec<String>)> {
     let original_size = data.len() as u64;
-    
+
     // Detect video format
     let _format = detect_video_format(filename)
         .ok_or_else(|| anyhow!("Unsupported video format: {}", filename))?;
-    
+
     // Create temporary files for input and output with proper extensions
-    let mut input_temp = NamedTempFile::with_suffix(".mp4")
-        .context("Failed to create temporary input file")?;
-    input_temp.write_all(data)
+    let mut input_temp =
+        NamedTempFile::with_suffix(".mp4").context("Failed to create temporary input file")?;
+    input_temp
+        .write_all(data)
         .context("Failed to write input data to temporary file")?;
-    input_temp.flush()
+    input_temp
+        .flush()
         .context("Failed to flush input data to temporary file")?;
-    
+
     // Ensure file is fully written and synced
-    input_temp.as_file().sync_all()
+    input_temp
+        .as_file()
+        .sync_all()
         .context("Failed to sync input data to disk")?;
-    
+
     let input_path = input_temp.path();
-    
-    let output_temp = NamedTempFile::with_suffix(".mp4")
-        .context("Failed to create temporary output file")?;
+
+    let output_temp =
+        NamedTempFile::with_suffix(".mp4").context("Failed to create temporary output file")?;
     let output_path = output_temp.path();
-    
-    
+
     // Calculate CRF from quality
     let crf = quality_to_crf(quality);
-    
+
     // Setup ffmpeg command
-    let mut ffmpeg_cmd = if let Some(path) = ffmpeg_path {
-        FfmpegCommand::new_with_path(path)
-    } else {
-        FfmpegCommand::new()
-    };
-    
+    let mut ffmpeg_cmd = ffmpeg_path.map_or_else(FfmpegCommand::new, |path| FfmpegCommand::new_with_path(path));
+
     // Configure ffmpeg command for HEVC encoding
     ffmpeg_cmd
         .input(input_path.to_string_lossy())
         .args([
-            "-nostats",               // Disable progress output with carriage returns
-            "-hide_banner",           // Hide banner for cleaner output
+            "-nostats",     // Disable progress output with carriage returns
+            "-hide_banner", // Hide banner for cleaner output
             // Let FFmpeg auto-detect input format instead of forcing mp4
-            "-c:v", "libx265",       // Use HEVC/H.265 encoder
-            "-crf", &crf.to_string(), // Quality setting
-            "-preset", "medium",      // Encoding speed vs compression trade-off
-            "-c:a", "copy",          // Copy audio stream without re-encoding
-            "-movflags", "+faststart", // Optimize for web streaming
-            "-y"                     // Overwrite output file if it exists
+            "-c:v",
+            "libx265", // Use HEVC/H.265 encoder
+            "-crf",
+            &crf.to_string(), // Quality setting
+            "-preset",
+            "medium", // Encoding speed vs compression trade-off
+            "-c:a",
+            "copy", // Copy audio stream without re-encoding
+            "-movflags",
+            "+faststart", // Optimize for web streaming
+            "-y",         // Overwrite output file if it exists
         ])
         .output(output_path.to_string_lossy());
-    
-    
+
     // Execute FFmpeg and capture result
     // Note: For now, using simple execution approach since event iteration was causing hangs
     // TODO: Investigate ffmpeg-sidecar event iteration issues in the future
@@ -124,25 +128,31 @@ pub fn compress_video_file(
         .context("Failed to spawn ffmpeg process")?
         .wait()
         .context("Failed to wait for ffmpeg process")?;
-    
+
     if !result.success() {
-        return Err(anyhow!("FFmpeg execution failed with exit code: {:?}", result.code()));
+        return Err(anyhow!(
+            "FFmpeg execution failed with exit code: {:?}",
+            result.code()
+        ));
     }
-    
+
     // For now, provide a simple log message since event capture was problematic
     let log_messages = vec!["HEVC video compression completed".to_string()];
-    
+
     // Read compressed data from output file
-    let compressed_data = fs::read(output_path)
-        .context("Failed to read compressed video data")?;
+    let compressed_data = fs::read(output_path).context("Failed to read compressed video data")?;
     let compressed_size = compressed_data.len() as u64;
-    
+
     // Explicitly keep temp files alive until here
     drop(input_temp);
     drop(output_temp);
-    
-    
-    Ok((compressed_data, original_size, compressed_size, log_messages))
+
+    Ok((
+        compressed_data,
+        original_size,
+        compressed_size,
+        log_messages,
+    ))
 }
 
 #[cfg(test)]
@@ -166,7 +176,10 @@ mod tests {
         assert_eq!(detect_video_format("test.mp4"), Some(VideoFormat::Mp4));
         assert_eq!(detect_video_format("test.MP4"), Some(VideoFormat::Mp4));
         assert_eq!(detect_video_format("test.mov"), Some(VideoFormat::Mov));
-        assert_eq!(detect_video_format("Video/movie.avi"), Some(VideoFormat::Avi));
+        assert_eq!(
+            detect_video_format("Video/movie.avi"),
+            Some(VideoFormat::Avi)
+        );
         assert_eq!(detect_video_format("test.mkv"), Some(VideoFormat::Mkv));
         assert_eq!(detect_video_format("test.wmv"), None);
         assert_eq!(detect_video_format("test.txt"), None);
@@ -175,18 +188,18 @@ mod tests {
     #[test]
     fn test_quality_to_crf() {
         // Test boundary values
-        assert_eq!(quality_to_crf(1), 51);    // Lowest quality
-        assert_eq!(quality_to_crf(100), 18);  // Highest quality
-        
+        assert_eq!(quality_to_crf(1), 51); // Lowest quality
+        assert_eq!(quality_to_crf(100), 18); // Highest quality
+
         // Test middle values
-        assert_eq!(quality_to_crf(50), 35);   // Balanced
-        
+        assert_eq!(quality_to_crf(50), 35); // Balanced
+
         // Test clamping
-        assert_eq!(quality_to_crf(0), 51);    // Should clamp to 1
-        assert_eq!(quality_to_crf(101), 18);  // Should clamp to 100
-        
+        assert_eq!(quality_to_crf(0), 51); // Should clamp to 1
+        assert_eq!(quality_to_crf(101), 18); // Should clamp to 100
+
         // Test specific quality ranges
-        assert_eq!(quality_to_crf(30), 42);   // Lower quality
-        assert_eq!(quality_to_crf(80), 25);   // Higher quality
+        assert_eq!(quality_to_crf(30), 42); // Lower quality
+        assert_eq!(quality_to_crf(80), 25); // Higher quality
     }
 }

@@ -1,16 +1,16 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use log::{info, warn, error};
-use std::collections::{VecDeque, HashMap};
+use log::{error, info, warn};
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use thiserror::Error;
 use zip::{ZipArchive, ZipWriter};
 
-mod image;
 mod audio;
+mod image;
 mod video;
 
 #[derive(Error, Debug)]
@@ -76,7 +76,7 @@ impl ProgressLogger {
             if let Some(line) = self.log_lines.get(i) {
                 log_bar.set_message(line.clone());
             } else {
-                log_bar.set_message("".to_string());
+                log_bar.set_message(String::new());
             }
         }
     }
@@ -97,7 +97,7 @@ impl ProgressLogger {
 
         // Show any remaining logs normally
         for line in &self.log_lines {
-            println!("{}", line);
+            println!("{line}");
         }
     }
 }
@@ -137,25 +137,31 @@ enum Commands {
         #[arg(long, help = "Skip audio compression")]
         skip_audio: bool,
 
-        #[arg(long, help = "Path to ffmpeg binary (optional, auto-detected if not provided)")]
+        #[arg(
+            long,
+            help = "Path to ffmpeg binary (optional, auto-detected if not provided)"
+        )]
         ffmpeg_path: Option<PathBuf>,
 
-        #[arg(long, help = "Always use compressed file even if it's larger than original")]
+        #[arg(
+            long,
+            help = "Always use compressed file even if it's larger than original"
+        )]
         always_compress: bool,
     },
 }
 
-
 fn format_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    #[allow(clippy::cast_precision_loss)]
     let mut size = bytes as f64;
     let mut unit_index = 0;
-    
+
     while size >= 1024.0 && unit_index < UNITS.len() - 1 {
         size /= 1024.0;
         unit_index += 1;
     }
-    
+
     if unit_index == 0 {
         format!("{} {}", bytes, UNITS[unit_index])
     } else {
@@ -164,13 +170,12 @@ fn format_size(bytes: u64) -> String {
 }
 
 /// Get ANSI color code for log level
-fn get_log_color(level: log::Level) -> &'static str {
+const fn get_log_color(level: log::Level) -> &'static str {
     match level {
-        log::Level::Error => "\x1b[91m",   // Red
-        log::Level::Warn  => "\x1b[33m",   // Orange-red/Yellow
-        log::Level::Info  => "\x1b[32m",   // Darker green (same as Cargo)
-        log::Level::Debug => "\x1b[90m",   // Grey
-        log::Level::Trace => "\x1b[90m",   // Grey
+        log::Level::Error => "\x1b[91m", // Red
+        log::Level::Warn => "\x1b[33m",  // Orange-red/Yellow
+        log::Level::Info => "\x1b[32m",  // Darker green (same as Cargo)
+        log::Level::Debug | log::Level::Trace => "\x1b[90m", // Grey
     }
 }
 
@@ -178,42 +183,49 @@ fn main() {
     // Initialize logger with custom grey time format, using stderr to not interfere with progress bar
     let mut builder = env_logger::Builder::new();
     builder.target(env_logger::Target::Stderr);
-    
+
     // Custom formatter to show only grey time on the left
     builder.format(|buf, record| {
         use std::io::Write;
         use std::time::{SystemTime, UNIX_EPOCH};
-        
+
         // Get current local time
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        
+
         // Convert to local time (simple UTC offset approximation)
         let local_offset = 0; // Using UTC for simplicity, could be enhanced with timezone detection
         let local_time = now + local_offset;
-        
+
         // Extract hours, minutes, seconds
         let hours = (local_time / 3600) % 24;
         let minutes = (local_time / 60) % 60;
         let seconds = local_time % 60;
-        
+
         // Format with grey timestamp and color-coded message based on log level
         let message_color = get_log_color(record.level());
-        writeln!(buf, "\x1b[90m{:02}:{:02}:{:02}\x1b[0m {}{}\x1b[0m", 
-                 hours, minutes, seconds, message_color, record.args())
+        writeln!(
+            buf,
+            "\x1b[90m{:02}:{:02}:{:02}\x1b[0m {}{}\x1b[0m",
+            hours,
+            minutes,
+            seconds,
+            message_color,
+            record.args()
+        )
     });
-    
+
     // Set default to info level if RUST_LOG is not set
     if std::env::var("RUST_LOG").is_err() {
         builder.filter_level(log::LevelFilter::Info);
     } else {
         builder.parse_default_env();
     }
-    
+
     builder.init();
-    
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -229,13 +241,24 @@ fn main() {
             ffmpeg_path,
             always_compress,
         } => {
-            match compress_pack(input_pack, output_pack, image_quality, audio_quality, video_quality, skip_image, skip_audio, skip_video, ffmpeg_path, always_compress) {
+            match compress_pack(
+                input_pack,
+                output_pack,
+                image_quality,
+                audio_quality,
+                video_quality,
+                skip_image,
+                skip_audio,
+                skip_video,
+                ffmpeg_path,
+                always_compress,
+            ) {
                 Ok(()) => {
                     // Success - exit normally
                 }
                 Err(e) => {
                     // Display error in red using our custom logger and exit with error code
-                    error!("{}", e);
+                    error!("{e}");
                     std::process::exit(1);
                 }
             }
@@ -265,27 +288,26 @@ fn compress_pack(
     }
 
     // Determine output path
-    let output_path = match output_pack {
-        Some(path) => path,
-        None => {
-            let mut path = input_pack.clone();
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| anyhow!("Invalid file name"))?;
-            path.set_file_name(format!("{}_compressed.siq", stem));
-            path
-        }
+    let output_path = if let Some(path) = output_pack {
+        path
+    } else {
+        let mut path = input_pack.clone();
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow!("Invalid file name"))?;
+        path.set_file_name(format!("{stem}_compressed.siq"));
+        path
     };
 
-    info!("Compressing pack: {:?}", input_pack);
-    info!("Output to: {:?}", output_path);
-    info!("Image quality: {}", image_quality);
-    info!("Audio quality: {}", audio_quality);
-    info!("Video quality: {}", video_quality);
-    info!("Skip image: {}", skip_image);
-    info!("Skip audio: {}", skip_audio);
-    info!("Skip video: {}", skip_video);
+    info!("Compressing pack: {input_pack:?}");
+    info!("Output to: {output_path:?}");
+    info!("Image quality: {image_quality}");
+    info!("Audio quality: {audio_quality}");
+    info!("Video quality: {video_quality}");
+    info!("Skip image: {skip_image}");
+    info!("Skip audio: {skip_audio}");
+    info!("Skip video: {skip_video}");
 
     // Detect or validate ffmpeg path
     let ffmpeg_available = if let Some(path) = &ffmpeg_path {
@@ -308,7 +330,9 @@ fn compress_pack(
                 if !skip_video {
                     warn!("ffmpeg not found in PATH. Video compression will be skipped.");
                     info!("To enable video compression:");
-                    info!("  1. Install ffmpeg: brew install ffmpeg (macOS) or apt install ffmpeg (Ubuntu)");
+                    info!(
+                        "  1. Install ffmpeg: brew install ffmpeg (macOS) or apt install ffmpeg (Ubuntu)"
+                    );
                     info!("  2. Or specify path with --ffmpeg-path");
                     info!("  3. Or use --skip-video to suppress this warning");
                 }
@@ -349,18 +373,18 @@ fn compress_pack(
     let mut processed_video = 0;
     let mut skipped_video = 0;
     let _kept_original_video = 0; // Video kept original due to size
-    
+
     let mut image_original_size = 0u64;
     let mut image_compressed_size = 0u64;
     let mut audio_original_size = 0u64;
     let mut audio_compressed_size = 0u64;
     let mut video_original_size = 0u64;
     let mut video_compressed_size = 0u64;
-    
+
     // Track total file sizes (for overall statistics)
     let mut total_input_size = 0u64;
     let mut total_output_size = 0u64;
-    
+
     // Track image conversions for content.xml updates
     let mut image_conversions: HashMap<String, String> = HashMap::new();
     let mut content_xml_data: Option<String> = None;
@@ -368,7 +392,7 @@ fn compress_pack(
     // Initialize progress logger
     let total_files = archive.len() as u64;
     let mut logger = ProgressLogger::new(total_files);
-    
+
     // Temporarily raise log level during progress display to suppress verbose audio library logs
     // This prevents Symphonia INFO logs from interfering with the progress bar
     log::set_max_level(log::LevelFilter::Warn);
@@ -392,12 +416,12 @@ fn compress_pack(
             let mut xml_data = String::new();
             file.read_to_string(&mut xml_data)
                 .with_context(|| "Failed to read content.xml as UTF-8")?;
-            
+
             // Track input size
             total_input_size += xml_data.len() as u64;
-            
+
             content_xml_data = Some(xml_data);
-            
+
             // We'll write content.xml after processing all images
             logger.log("  Stored content.xml for path updates".to_string());
         } else if is_image {
@@ -413,7 +437,7 @@ fn compress_pack(
                 Ok((compressed_data, original_size, compressed_size)) => {
                     // Convert to WebP filename
                     let webp_filename = image::to_webp_filename(&file_name);
-                    
+
                     // Add compressed image to output ZIP with WebP extension
                     zip_writer
                         .start_file(&webp_filename, zip::write::FileOptions::default())
@@ -452,9 +476,9 @@ fn compress_pack(
                     zip_writer
                         .write_all(&image_data)
                         .with_context(|| format!("Failed to write original file: {}", file_name))?;
-                    
+
                     total_output_size += image_data.len() as u64;
-                    
+
                     // Do NOT track this conversion - content.xml will keep original path
                 }
             }
@@ -463,10 +487,10 @@ fn compress_pack(
             let mut audio_data = Vec::new();
             file.read_to_end(&mut audio_data)
                 .with_context(|| format!("Failed to read audio data: {}", file_name))?;
-            
+
             // Track input size
             total_input_size += audio_data.len() as u64;
-            
+
             // Try to compress audio
             match audio::compress_audio_file(&audio_data, &file_name, audio_quality) {
                 Ok((compressed_data, original_size, compressed_size)) => {
@@ -495,7 +519,7 @@ fn compress_pack(
                 Err(e) => {
                     logger.log(format!("  Skipping {}: {}", file_name, e));
                     skipped_audio += 1;
-                    
+
                     // Track original size for skipped audio
                     audio_original_size += audio_data.len() as u64;
 
@@ -505,10 +529,10 @@ fn compress_pack(
                         .with_context(|| {
                             format!("Failed to start file in output ZIP: {}", file_name)
                         })?;
-                    zip_writer
-                        .write_all(&audio_data)
-                        .with_context(|| format!("Failed to write original audio file: {}", file_name))?;
-                    
+                    zip_writer.write_all(&audio_data).with_context(|| {
+                        format!("Failed to write original audio file: {}", file_name)
+                    })?;
+
                     total_output_size += audio_data.len() as u64;
                 }
             }
@@ -517,13 +541,20 @@ fn compress_pack(
             let mut video_data = Vec::new();
             file.read_to_end(&mut video_data)
                 .with_context(|| format!("Failed to read video data: {}", file_name))?;
-            
+
             // Track input size
             total_input_size += video_data.len() as u64;
-            
+
             if skip_video || !ffmpeg_available {
-                let reason = if skip_video { "skip_video flag" } else { "ffmpeg not available" };
-                logger.log(format!("  Skipping video compression ({}): {}", reason, file_name));
+                let reason = if skip_video {
+                    "skip_video flag"
+                } else {
+                    "ffmpeg not available"
+                };
+                logger.log(format!(
+                    "  Skipping video compression ({}): {}",
+                    reason, file_name
+                ));
                 skipped_video += 1;
                 video_original_size += video_data.len() as u64;
 
@@ -533,14 +564,19 @@ fn compress_pack(
                     .with_context(|| {
                         format!("Failed to start file in output ZIP: {}", file_name)
                     })?;
-                zip_writer
-                    .write_all(&video_data)
-                    .with_context(|| format!("Failed to write original video file: {}", file_name))?;
-                
+                zip_writer.write_all(&video_data).with_context(|| {
+                    format!("Failed to write original video file: {}", file_name)
+                })?;
+
                 total_output_size += video_data.len() as u64;
             } else {
                 // Try to compress video using ffmpeg-sidecar
-                match video::compress_video_file(&video_data, &file_name, video_quality, ffmpeg_path.as_deref()) {
+                match video::compress_video_file(
+                    &video_data,
+                    &file_name,
+                    video_quality,
+                    ffmpeg_path.as_deref(),
+                ) {
                     Ok((compressed_data, original_size, compressed_size, log_messages)) => {
                         // Display ffmpeg logs in the progress logger
                         for log_msg in log_messages {
@@ -569,9 +605,12 @@ fn compress_pack(
                         ));
                     }
                     Err(e) => {
-                        logger.log(format!("  Video compression failed for {}: {}", file_name, e));
+                        logger.log(format!(
+                            "  Video compression failed for {}: {}",
+                            file_name, e
+                        ));
                         skipped_video += 1;
-                        
+
                         // Track original size for skipped video
                         video_original_size += video_data.len() as u64;
 
@@ -581,10 +620,10 @@ fn compress_pack(
                             .with_context(|| {
                                 format!("Failed to start file in output ZIP: {}", file_name)
                             })?;
-                        zip_writer
-                            .write_all(&video_data)
-                            .with_context(|| format!("Failed to write original video file: {}", file_name))?;
-                        
+                        zip_writer.write_all(&video_data).with_context(|| {
+                            format!("Failed to write original video file: {}", file_name)
+                        })?;
+
                         total_output_size += video_data.len() as u64;
                     }
                 }
@@ -604,7 +643,7 @@ fn compress_pack(
             zip_writer
                 .write_all(&buffer)
                 .with_context(|| format!("Failed to write file: {}", file_name))?;
-            
+
             total_output_size += buffer.len() as u64;
         }
 
@@ -615,30 +654,36 @@ fn compress_pack(
     // Process content.xml with updated image paths
     if let Some(mut xml_content) = content_xml_data {
         logger.log("Updating content.xml with new image paths".to_string());
-        
+
         let mut total_updated_refs = 0;
-        
+
         // Update image paths in content.xml
         for (original_path, webp_path) in &image_conversions {
             // Extract just the filename from the full path for the XML replacement
-            let original_filename = original_path.strip_prefix("Images/").unwrap_or(original_path);
+            let original_filename = original_path
+                .strip_prefix("Images/")
+                .unwrap_or(original_path);
             let webp_filename = webp_path.strip_prefix("Images/").unwrap_or(webp_path);
-            
+
             // Try different encoding variations of the filename
             let original_variations = vec![
                 original_filename.to_string(),
-                urlencoding::decode(original_filename).unwrap_or_else(|_| original_filename.into()).to_string(),
+                urlencoding::decode(original_filename)
+                    .unwrap_or_else(|_| original_filename.into())
+                    .to_string(),
                 urlencoding::encode(original_filename).to_string(),
             ];
-            
+
             let webp_variations = vec![
                 webp_filename.to_string(),
-                urlencoding::decode(webp_filename).unwrap_or_else(|_| webp_filename.into()).to_string(),
+                urlencoding::decode(webp_filename)
+                    .unwrap_or_else(|_| webp_filename.into())
+                    .to_string(),
                 urlencoding::encode(webp_filename).to_string(),
             ];
-            
+
             let mut file_replacements = 0;
-            
+
             // Try all combinations of original and webp variations
             for orig_var in &original_variations {
                 for webp_var in &webp_variations {
@@ -647,17 +692,32 @@ fn compress_pack(
                         // Simple filename reference
                         (orig_var.clone(), webp_var.clone()),
                         // With isRef="True" wrapper
-                        (format!("isRef=\"True\">{}", orig_var), format!("isRef=\"True\">{}", webp_var)),
+                        (
+                            format!("isRef=\"True\">{}", orig_var),
+                            format!("isRef=\"True\">{}", webp_var),
+                        ),
                         // With type="image" attribute
-                        (format!("type=\"image\" isRef=\"True\">{}", orig_var), format!("type=\"image\" isRef=\"True\">{}", webp_var)),
+                        (
+                            format!("type=\"image\" isRef=\"True\">{}", orig_var),
+                            format!("type=\"image\" isRef=\"True\">{}", webp_var),
+                        ),
                         // With different quote styles
-                        (format!("isRef='True'>{}", orig_var), format!("isRef='True'>{}", webp_var)),
+                        (
+                            format!("isRef='True'>{}", orig_var),
+                            format!("isRef='True'>{}", webp_var),
+                        ),
                         // Full path references
-                        (format!("Images/{}", orig_var), format!("Images/{}", webp_var)),
+                        (
+                            format!("Images/{}", orig_var),
+                            format!("Images/{}", webp_var),
+                        ),
                         // Path references with isRef
-                        (format!("isRef=\"True\">Images/{}", orig_var), format!("isRef=\"True\">Images/{}", webp_var)),
+                        (
+                            format!("isRef=\"True\">Images/{}", orig_var),
+                            format!("isRef=\"True\">Images/{}", webp_var),
+                        ),
                     ];
-                    
+
                     for (old_pattern, new_pattern) in patterns {
                         if old_pattern != new_pattern {
                             let count = xml_content.matches(&old_pattern).count();
@@ -669,16 +729,22 @@ fn compress_pack(
                     }
                 }
             }
-            
+
             total_updated_refs += file_replacements;
-            
+
             if file_replacements > 0 {
-                logger.log(format!("  Updated: {} -> {} ({} refs)", original_filename, webp_filename, file_replacements));
+                logger.log(format!(
+                    "  Updated: {} -> {} ({} refs)",
+                    original_filename, webp_filename, file_replacements
+                ));
             } else {
-                logger.log(format!("  Warning: No refs found for {}", original_filename));
+                logger.log(format!(
+                    "  Warning: No refs found for {}",
+                    original_filename
+                ));
             }
         }
-        
+
         // Write updated content.xml to output ZIP
         zip_writer
             .start_file("content.xml", zip::write::FileOptions::default())
@@ -686,11 +752,14 @@ fn compress_pack(
         zip_writer
             .write_all(xml_content.as_bytes())
             .with_context(|| "Failed to write updated content.xml")?;
-            
+
         // Track output size
         total_output_size += xml_content.len() as u64;
-            
-        logger.log(format!("Updated {} image references in content.xml", total_updated_refs));
+
+        logger.log(format!(
+            "Updated {} image references in content.xml",
+            total_updated_refs
+        ));
     } else {
         logger.log("Warning: No content.xml found in pack".to_string());
     }
@@ -701,71 +770,92 @@ fn compress_pack(
 
     // Finish progress logging and show final summary
     logger.finish();
-    
+
     // Restore original log level for final summary
     log::set_max_level(log::LevelFilter::Info);
 
     info!("Compression complete!");
-    
+
     // Images statistics
     println!("\nImages:");
     println!("  Processed: {}", processed_images);
     println!("  Skipped: {}", skipped_images);
     if image_original_size > 0 {
-        println!("  Size reduction: {} -> {} ({:.1}% reduction)",
+        println!(
+            "  Size reduction: {} -> {} ({:.1}% reduction)",
             format_size(image_original_size),
             format_size(image_compressed_size),
             (1.0 - image_compressed_size as f64 / image_original_size as f64) * 100.0
         );
     }
-    
+
     // Audio statistics
     println!("\nAudio:");
     println!("  Processed: {}", processed_audio);
     println!("  Skipped: {}", skipped_audio);
     if audio_original_size > 0 {
         if audio_compressed_size > 0 {
-            println!("  Size reduction: {} -> {} ({:.1}% reduction)",
+            println!(
+                "  Size reduction: {} -> {} ({:.1}% reduction)",
                 format_size(audio_original_size),
                 format_size(audio_compressed_size),
                 (1.0 - audio_compressed_size as f64 / audio_original_size as f64) * 100.0
             );
         } else {
-            println!("  Total size: {} (no compression applied)", format_size(audio_original_size));
+            println!(
+                "  Total size: {} (no compression applied)",
+                format_size(audio_original_size)
+            );
         }
     }
-    
+
     // Video statistics
     println!("\nVideo:");
     println!("  Processed: {}", processed_video);
     println!("  Skipped: {}", skipped_video);
     if video_original_size > 0 {
         if video_compressed_size > 0 {
-            println!("  Size reduction: {} -> {} ({:.1}% reduction)",
+            println!(
+                "  Size reduction: {} -> {} ({:.1}% reduction)",
                 format_size(video_original_size),
                 format_size(video_compressed_size),
                 (1.0 - video_compressed_size as f64 / video_original_size as f64) * 100.0
             );
         } else {
-            println!("  Total size: {} (no compression applied)", format_size(video_original_size));
+            println!(
+                "  Total size: {} (no compression applied)",
+                format_size(video_original_size)
+            );
         }
     }
-    
+
     // Overall statistics
     if total_input_size > 0 {
         println!("\nOverall:");
         println!("  Total original size: {}", format_size(total_input_size));
-        println!("  Total compressed size: {}", format_size(total_output_size));
-        println!("  Total reduction: {:.1}%", (1.0 - total_output_size as f64 / total_input_size as f64) * 100.0);
-        
+        println!(
+            "  Total compressed size: {}",
+            format_size(total_output_size)
+        );
+        println!(
+            "  Total reduction: {:.1}%",
+            (1.0 - total_output_size as f64 / total_input_size as f64) * 100.0
+        );
+
         // Show actual filesystem sizes for verification
         if let Ok(input_metadata) = std::fs::metadata(&input_pack) {
             let input_file_size = input_metadata.len();
-            println!("  Input file size: {} (filesystem)", format_size(input_file_size));
+            println!(
+                "  Input file size: {} (filesystem)",
+                format_size(input_file_size)
+            );
         }
         if let Ok(output_metadata) = std::fs::metadata(&output_path) {
             let output_file_size = output_metadata.len();
-            println!("  Output file size: {} (filesystem)", format_size(output_file_size));
+            println!(
+                "  Output file size: {} (filesystem)",
+                format_size(output_file_size)
+            );
         }
     }
 
@@ -793,7 +883,18 @@ mod tests {
 
     #[test]
     fn test_invalid_input_validation() {
-        let result = compress_pack(PathBuf::from("nonexistent.siq"), None, 85, 85, 75, false, None);
+        let result = compress_pack(
+            PathBuf::from("nonexistent.siq"),
+            None,
+            85,
+            85,
+            75,
+            false,
+            false,
+            false,
+            None,
+            false,
+        );
         assert!(result.is_err());
 
         // Create a temporary file without .siq extension
@@ -801,7 +902,7 @@ mod tests {
         temp_file.write_all(b"test").unwrap();
         let temp_path = temp_file.path().to_path_buf();
 
-        let result = compress_pack(temp_path, None, 85, 85, 75, false, None);
+        let result = compress_pack(temp_path, None, 85, 85, 75, false, false, false, None, false);
         assert!(result.is_err());
     }
 
@@ -810,26 +911,26 @@ mod tests {
         // Quality should be between 1 and 100
         let temp_siq = create_temp_siq_file();
 
-        let result = compress_pack(temp_siq.clone(), None, 0, 85, 75, false, None);
+        let result = compress_pack(temp_siq.clone(), None, 0, 85, 75, false, false, false, None, false);
         assert!(result.is_err());
 
-        let result = compress_pack(temp_siq.clone(), None, 101, 85, 75, false, None);
+        let result = compress_pack(temp_siq.clone(), None, 101, 85, 75, false, false, false, None, false);
         assert!(result.is_err());
 
-        let result = compress_pack(temp_siq.clone(), None, 85, 0, 75, false, None);
+        let result = compress_pack(temp_siq.clone(), None, 85, 0, 75, false, false, false, None, false);
         assert!(result.is_err());
 
-        let result = compress_pack(temp_siq.clone(), None, 85, 101, 75, false, None);
+        let result = compress_pack(temp_siq.clone(), None, 85, 101, 75, false, false, false, None, false);
         assert!(result.is_err());
 
-        let result = compress_pack(temp_siq.clone(), None, 85, 85, 0, false, None);
+        let result = compress_pack(temp_siq.clone(), None, 85, 85, 0, false, false, false, None, false);
         assert!(result.is_err());
 
-        let result = compress_pack(temp_siq.clone(), None, 85, 85, 101, false, None);
+        let result = compress_pack(temp_siq.clone(), None, 85, 85, 101, false, false, false, None, false);
         assert!(result.is_err());
 
         // Valid quality should work (though will fail due to invalid ZIP content)
-        let result = compress_pack(temp_siq, None, 50, 75, 60, false, None);
+        let result = compress_pack(temp_siq, None, 50, 75, 60, false, false, false, None, false);
         // This will fail at ZIP reading stage, but quality validation should pass
         assert!(result.is_err());
         assert!(
