@@ -163,7 +163,18 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-fn main() -> Result<()> {
+/// Get ANSI color code for log level
+fn get_log_color(level: log::Level) -> &'static str {
+    match level {
+        log::Level::Error => "\x1b[91m",   // Red
+        log::Level::Warn  => "\x1b[33m",   // Orange-red/Yellow
+        log::Level::Info  => "\x1b[32m",   // Darker green (same as Cargo)
+        log::Level::Debug => "\x1b[90m",   // Grey
+        log::Level::Trace => "\x1b[90m",   // Grey
+    }
+}
+
+fn main() {
     // Initialize logger with custom grey time format, using stderr to not interfere with progress bar
     let mut builder = env_logger::Builder::new();
     builder.target(env_logger::Target::Stderr);
@@ -188,8 +199,10 @@ fn main() -> Result<()> {
         let minutes = (local_time / 60) % 60;
         let seconds = local_time % 60;
         
-        // Format with grey color: \x1b[90m for grey, \x1b[0m to reset
-        writeln!(buf, "\x1b[90m{:02}:{:02}:{:02}\x1b[0m {}", hours, minutes, seconds, record.args())
+        // Format with grey timestamp and color-coded message based on log level
+        let message_color = get_log_color(record.level());
+        writeln!(buf, "\x1b[90m{:02}:{:02}:{:02}\x1b[0m {}{}\x1b[0m", 
+                 hours, minutes, seconds, message_color, record.args())
     });
     
     // Set default to info level if RUST_LOG is not set
@@ -216,11 +229,18 @@ fn main() -> Result<()> {
             ffmpeg_path,
             always_compress,
         } => {
-            compress_pack(input_pack, output_pack, image_quality, audio_quality, video_quality, skip_image, skip_audio, skip_video, ffmpeg_path, always_compress)?;
+            match compress_pack(input_pack, output_pack, image_quality, audio_quality, video_quality, skip_image, skip_audio, skip_video, ffmpeg_path, always_compress) {
+                Ok(()) => {
+                    // Success - exit normally
+                }
+                Err(e) => {
+                    // Display error in red using our custom logger and exit with error code
+                    error!("{}", e);
+                    std::process::exit(1);
+                }
+            }
         }
     }
-
-    Ok(())
 }
 
 fn compress_pack(
