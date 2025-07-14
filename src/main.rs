@@ -26,6 +26,7 @@ pub enum SicomError {
 struct ProgressLogger {
     _multi_progress: MultiProgress, // Keep alive but prefix with _ to suppress warning
     progress_bar: ProgressBar,
+    video_progress_bar: Option<ProgressBar>, // Video encoding progress
     log_bars: Vec<ProgressBar>,
     log_lines: VecDeque<String>,
     max_lines: usize,
@@ -56,6 +57,7 @@ impl ProgressLogger {
         Self {
             _multi_progress: multi_progress,
             progress_bar,
+            video_progress_bar: None,
             log_bars,
             log_lines: VecDeque::new(),
             max_lines: 6,
@@ -85,7 +87,28 @@ impl ProgressLogger {
         self.progress_bar.inc(1);
     }
 
+    fn start_video_progress(&mut self, filename: &str) {
+        let video_bar = self._multi_progress.add(ProgressBar::new(100));
+        video_bar.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.blue} Encoding {msg}: [{wide_bar:.yellow/blue}] {percent}%")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        video_bar.set_message(filename.to_string());
+        self.video_progress_bar = Some(video_bar);
+    }
+
+    fn finish_video_progress(&mut self) {
+        if let Some(bar) = self.video_progress_bar.take() {
+            bar.finish_and_clear();
+        }
+    }
+
     fn finish(&mut self) {
+        // Finish video progress bar if still active
+        self.finish_video_progress();
+
         self.progress_bar.finish();
 
         // Clear all log bars
@@ -697,17 +720,19 @@ fn compress_pack(
                 total_output_size += video_data.len() as u64;
             } else {
                 // Try to compress video using ffmpeg-sidecar
-                match video::compress_video_file(
+                logger.start_video_progress(&file_name);
+                let video_result = video::compress_video_file(
                     &video_data,
                     &file_name,
                     video_quality,
                     ffmpeg_path.as_deref(),
-                ) {
-                    Ok((compressed_data, original_size, compressed_size, log_messages)) => {
-                        // Display ffmpeg logs in the progress logger
-                        for log_msg in log_messages {
-                            logger.log(log_msg);
-                        }
+                    &mut logger,
+                );
+                
+                match video_result {
+                    Ok((compressed_data, original_size, compressed_size)) => {
+                        logger.finish_video_progress();
+                        // FFmpeg logs are now handled in real-time during compression
 
                         // Check if compression actually reduced size
                         if compressed_size >= original_size && !always_compress {
@@ -765,6 +790,7 @@ fn compress_pack(
                         }
                     }
                     Err(e) => {
+                        logger.finish_video_progress(); // Cleanup on error
                         logger.log(format!(
                             "  Video compression failed for {}: {}",
                             file_name, e

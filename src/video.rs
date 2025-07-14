@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use ffmpeg_sidecar::command::FfmpegCommand;
+use ffmpeg_sidecar::event::{FfmpegEvent, LogLevel};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -40,6 +41,35 @@ fn detect_video_format(filename: &str) -> Option<VideoFormat> {
     })
 }
 
+/// Parse FFmpeg time string (e.g., "00:01:23.45") to seconds
+/// Returns approximate progress percentage (0-100) based on heuristics
+/// Since we don't know total duration, we estimate based on time elapsed
+fn parse_time_to_progress_percent(time_str: &str) -> u64 {
+    // Parse time format: HH:MM:SS.MS or MM:SS.MS
+    let parts: Vec<&str> = time_str.split(':').collect();
+    let total_seconds = match parts.len() {
+        3 => {
+            // HH:MM:SS.MS format
+            let hours: f64 = parts[0].parse().unwrap_or(0.0);
+            let minutes: f64 = parts[1].parse().unwrap_or(0.0);
+            let seconds: f64 = parts[2].parse().unwrap_or(0.0);
+            hours * 3600.0 + minutes * 60.0 + seconds
+        },
+        2 => {
+            // MM:SS.MS format
+            let minutes: f64 = parts[0].parse().unwrap_or(0.0);
+            let seconds: f64 = parts[1].parse().unwrap_or(0.0);
+            minutes * 60.0 + seconds
+        },
+        _ => return 0, // Invalid format
+    };
+
+    // Heuristic: assume most videos are 10-60 seconds for SIGame packs
+    // Map 0-60 seconds to 0-100% progress
+    let estimated_progress = (total_seconds / 60.0 * 100.0).min(100.0);
+    estimated_progress as u64
+}
+
 /// Map quality (1-100) to x265 CRF value (0-51)
 /// Lower CRF = higher quality, larger size
 /// Higher CRF = lower quality, smaller size
@@ -58,13 +88,15 @@ fn quality_to_crf(quality: u8) -> u8 {
 }
 
 /// Compress video file using HEVC (H.265) encoding via ffmpeg-sidecar
-/// Returns (`compressed_data`, `original_size`, `compressed_size`, `log_messages`)
+/// Returns (`compressed_data`, `original_size`, `compressed_size`)
+/// Logging is handled in real-time through the provided logger
 pub fn compress_video_file(
     data: &[u8],
     filename: &str,
     quality: u8,
     ffmpeg_path: Option<&Path>,
-) -> Result<(Vec<u8>, u64, u64, Vec<String>)> {
+    logger: &mut crate::ProgressLogger,
+) -> Result<(Vec<u8>, u64, u64)> {
     let original_size = data.len() as u64;
 
     // Detect video format
@@ -120,24 +152,49 @@ pub fn compress_video_file(
         ])
         .output(output_path.to_string_lossy());
 
-    // Execute FFmpeg and capture result
-    // Note: For now, using simple execution approach since event iteration was causing hangs
-    // TODO: Investigate ffmpeg-sidecar event iteration issues in the future
-    let result = ffmpeg_cmd
+    // Execute FFmpeg with real-time event processing
+    let mut child = ffmpeg_cmd
         .spawn()
-        .context("Failed to spawn ffmpeg process")?
-        .wait()
-        .context("Failed to wait for ffmpeg process")?;
+        .context("Failed to spawn ffmpeg process")?;
+    
+    let iter = child
+        .iter()
+        .context("Failed to create event iterator")?;
 
-    if !result.success() {
-        return Err(anyhow!(
-            "FFmpeg execution failed with exit code: {:?}",
-            result.code()
-        ));
+    let mut has_error = false;
+    let mut error_message = String::new();
+
+    for event in iter {
+        match event {
+            FfmpegEvent::Log(log_level, message) => {
+                // Filter for warnings and errors only
+                match log_level {
+                    LogLevel::Warning | LogLevel::Error | LogLevel::Fatal => {
+                        logger.log(format!("FFmpeg: {}", message.trim()));
+                    },
+                    _ => {} // Ignore Info and Unknown levels
+                }
+            },
+            FfmpegEvent::Error(error_msg) => {
+                has_error = true;
+                error_message = error_msg.clone();
+                logger.log(format!("FFmpeg Error: {}", error_msg.trim()));
+            },
+            FfmpegEvent::Progress(progress) => {
+                // Update video progress bar based on time elapsed
+                if let Some(video_bar) = &logger.video_progress_bar {
+                    let progress_percent = parse_time_to_progress_percent(&progress.time);
+                    video_bar.set_position(progress_percent);
+                }
+            },
+            FfmpegEvent::Done => break,
+            _ => {} // Ignore other events (metadata, frames, etc.)
+        }
     }
 
-    // For now, provide a simple log message since event capture was problematic
-    let log_messages = vec!["HEVC video compression completed".to_string()];
+    if has_error {
+        return Err(anyhow!("FFmpeg execution failed: {}", error_message));
+    }
 
     // Read compressed data from output file
     let compressed_data = fs::read(output_path).context("Failed to read compressed video data")?;
@@ -147,12 +204,7 @@ pub fn compress_video_file(
     drop(input_temp);
     drop(output_temp);
 
-    Ok((
-        compressed_data,
-        original_size,
-        compressed_size,
-        log_messages,
-    ))
+    Ok((compressed_data, original_size, compressed_size))
 }
 
 #[cfg(test)]
@@ -201,5 +253,26 @@ mod tests {
         // Test specific quality ranges
         assert_eq!(quality_to_crf(30), 42); // Lower quality
         assert_eq!(quality_to_crf(80), 25); // Higher quality
+    }
+
+    #[test]
+    fn test_parse_time_to_progress_percent() {
+        // Test HH:MM:SS.MS format
+        assert_eq!(parse_time_to_progress_percent("00:00:30.00"), 50); // 30 seconds = 50%
+        assert_eq!(parse_time_to_progress_percent("00:01:00.00"), 100); // 60 seconds = 100%
+        assert_eq!(parse_time_to_progress_percent("00:00:15.50"), 25); // 15.5 seconds ≈ 25%
+
+        // Test MM:SS.MS format
+        assert_eq!(parse_time_to_progress_percent("00:30.00"), 50); // 30 seconds = 50%
+        assert_eq!(parse_time_to_progress_percent("01:00.00"), 100); // 60 seconds = 100%
+        assert_eq!(parse_time_to_progress_percent("00:15.50"), 25); // 15.5 seconds ≈ 25%
+
+        // Test boundary cases
+        assert_eq!(parse_time_to_progress_percent("00:00:00.00"), 0); // 0 seconds = 0%
+        assert_eq!(parse_time_to_progress_percent("00:02:00.00"), 100); // 120 seconds capped at 100%
+
+        // Test invalid format
+        assert_eq!(parse_time_to_progress_percent("invalid"), 0);
+        assert_eq!(parse_time_to_progress_percent(""), 0);
     }
 }
