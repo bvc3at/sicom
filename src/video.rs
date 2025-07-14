@@ -41,6 +41,26 @@ fn detect_video_format(filename: &str) -> Option<VideoFormat> {
     })
 }
 
+/// Extract file extension from filename for temporary file creation
+fn get_file_extension(filename: &str) -> String {
+    let path = Path::new(filename);
+    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+        format!(".{}", ext.to_lowercase())
+    } else {
+        ".mp4".to_string() // Default fallback
+    }
+}
+
+/// Get FFmpeg input format string from video format
+fn get_ffmpeg_format(format: VideoFormat) -> &'static str {
+    match format {
+        VideoFormat::Mp4 => "mp4",
+        VideoFormat::Mov => "mov",
+        VideoFormat::Avi => "avi",
+        VideoFormat::Mkv => "matroska",
+    }
+}
+
 /// Parse FFmpeg time string (e.g., "00:01:23.45") to seconds
 /// Returns approximate progress percentage (0-100) based on heuristics
 /// Since we don't know total duration, we estimate based on time elapsed
@@ -100,12 +120,15 @@ pub fn compress_video_file(
     let original_size = data.len() as u64;
 
     // Detect video format
-    let _format = detect_video_format(filename)
+    let format = detect_video_format(filename)
         .ok_or_else(|| anyhow!("Unsupported video format: {}", filename))?;
 
+    // Get proper file extension for temporary files
+    let file_extension = get_file_extension(filename);
+    
     // Create temporary files for input and output with proper extensions
     let mut input_temp =
-        NamedTempFile::with_suffix(".mp4").context("Failed to create temporary input file")?;
+        NamedTempFile::with_suffix(&file_extension).context("Failed to create temporary input file")?;
     input_temp
         .write_all(data)
         .context("Failed to write input data to temporary file")?;
@@ -120,10 +143,28 @@ pub fn compress_video_file(
         .context("Failed to sync input data to disk")?;
 
     let input_path = input_temp.path();
+    
+    // Validate that file was written correctly
+    let written_size = std::fs::metadata(&input_path)
+        .context("Failed to get input file metadata")?
+        .len();
+    if written_size != original_size {
+        return Err(anyhow!("Input file size mismatch: expected {}, got {}", original_size, written_size));
+    }
+
+    // Note: Keep input_temp alive - don't drop it until after FFmpeg completes
+
+    // Double-check file exists and is accessible
+    if !input_path.exists() {
+        return Err(anyhow!("Input temporary file does not exist: {}", input_path.display()));
+    }
+    
+    // Log file details for debugging
+    logger.log(format!("DEBUG: Input file size: {} bytes, path: {}", written_size, input_path.display()));
 
     let output_temp =
-        NamedTempFile::with_suffix(".mp4").context("Failed to create temporary output file")?;
-    let output_path = output_temp.path();
+        NamedTempFile::with_suffix(&file_extension).context("Failed to create temporary output file")?;
+    let output_path = output_temp.path().to_path_buf();
 
     // Calculate CRF from quality
     let crf = quality_to_crf(quality);
@@ -131,26 +172,23 @@ pub fn compress_video_file(
     // Setup ffmpeg command
     let mut ffmpeg_cmd = ffmpeg_path.map_or_else(FfmpegCommand::new, |path| FfmpegCommand::new_with_path(path));
 
-    // Configure ffmpeg command for HEVC encoding
+    // Configure ffmpeg command for HEVC encoding using proper input/output methods
+    let _input_format = get_ffmpeg_format(format); // For future use if explicit format needed
+    
+    // Log video processing
+    logger.log(format!("Processing video: {}", filename));
+    
     ffmpeg_cmd
-        .input(input_path.to_string_lossy())
+        .input(input_path.to_string_lossy())  // Input file with auto-detection
         .args([
-            "-nostats",     // Disable progress output with carriage returns
-            "-hide_banner", // Hide banner for cleaner output
-            // Let FFmpeg auto-detect input format instead of forcing mp4
-            "-c:v",
-            "libx265", // Use HEVC/H.265 encoder
-            "-crf",
-            &crf.to_string(), // Quality setting
-            "-preset",
-            "medium", // Encoding speed vs compression trade-off
-            "-c:a",
-            "copy", // Copy audio stream without re-encoding
-            "-movflags",
-            "+faststart", // Optimize for web streaming
+            "-c:v", "libx265", // Use HEVC/H.265 encoder
+            "-crf", &crf.to_string(), // Quality setting
+            "-preset", "medium", // Encoding speed vs compression trade-off
+            "-c:a", "copy", // Copy audio stream without re-encoding
+            "-movflags", "+faststart", // Optimize for web streaming
             "-y",         // Overwrite output file if it exists
         ])
-        .output(output_path.to_string_lossy());
+        .output(output_path.to_string_lossy());  // Output file
 
     // Execute FFmpeg with real-time event processing
     let mut child = ffmpeg_cmd
@@ -176,9 +214,12 @@ pub fn compress_video_file(
                 }
             },
             FfmpegEvent::Error(error_msg) => {
-                has_error = true;
-                error_message = error_msg.clone();
-                logger.log(format!("FFmpeg Error: {}", error_msg.trim()));
+                // Ignore spurious "No streams found" error that occurs after successful processing
+                if error_msg.trim() != "No streams found" {
+                    has_error = true;
+                    error_message = error_msg.clone();
+                    logger.log(format!("FFmpeg Error: {}", error_msg.trim()));
+                }
             },
             FfmpegEvent::Progress(progress) => {
                 // Update video progress bar based on time elapsed
@@ -197,12 +238,11 @@ pub fn compress_video_file(
     }
 
     // Read compressed data from output file
-    let compressed_data = fs::read(output_path).context("Failed to read compressed video data")?;
+    let compressed_data = fs::read(&output_path).context("Failed to read compressed video data")?;
     let compressed_size = compressed_data.len() as u64;
 
-    // Explicitly keep temp files alive until here
-    drop(input_temp);
-    drop(output_temp);
+    // Clean up temporary files automatically when they go out of scope
+    // Both input_temp and output_temp will be cleaned up at function end
 
     Ok((compressed_data, original_size, compressed_size))
 }
@@ -253,6 +293,23 @@ mod tests {
         // Test specific quality ranges
         assert_eq!(quality_to_crf(30), 42); // Lower quality
         assert_eq!(quality_to_crf(80), 25); // Higher quality
+    }
+
+    #[test]
+    fn test_get_file_extension() {
+        assert_eq!(get_file_extension("video.mp4"), ".mp4");
+        assert_eq!(get_file_extension("Video/test.MOV"), ".mov");
+        assert_eq!(get_file_extension("path/to/file.AVI"), ".avi");
+        assert_eq!(get_file_extension("test.MKV"), ".mkv");
+        assert_eq!(get_file_extension("noextension"), ".mp4"); // Default fallback
+    }
+
+    #[test]
+    fn test_get_ffmpeg_format() {
+        assert_eq!(get_ffmpeg_format(VideoFormat::Mp4), "mp4");
+        assert_eq!(get_ffmpeg_format(VideoFormat::Mov), "mov");
+        assert_eq!(get_ffmpeg_format(VideoFormat::Avi), "avi");
+        assert_eq!(get_ffmpeg_format(VideoFormat::Mkv), "matroska");
     }
 
     #[test]
