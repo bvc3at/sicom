@@ -276,7 +276,7 @@ fn compress_pack(
     skip_audio: bool,
     skip_video: bool,
     ffmpeg_path: Option<PathBuf>,
-    _always_compress: bool,
+    always_compress: bool,
 ) -> Result<()> {
     // Validate input
     if !input_pack.exists() {
@@ -366,13 +366,13 @@ fn compress_pack(
     // Statistics tracking
     let mut processed_images = 0;
     let mut skipped_images = 0;
-    let _kept_original_images = 0; // Images kept original due to size
+    let mut kept_original_images = 0; // Images kept original due to size
     let mut processed_audio = 0;
     let mut skipped_audio = 0;
-    let _kept_original_audio = 0; // Audio kept original due to size
+    let mut kept_original_audio = 0; // Audio kept original due to size
     let mut processed_video = 0;
     let mut skipped_video = 0;
-    let _kept_original_video = 0; // Video kept original due to size
+    let mut kept_original_video = 0; // Video kept original due to size
 
     let mut image_original_size = 0u64;
     let mut image_compressed_size = 0u64;
@@ -435,33 +435,68 @@ fn compress_pack(
 
             match image::compress_image_file(&image_data, &file_name, image_quality) {
                 Ok((compressed_data, original_size, compressed_size)) => {
-                    // Convert to WebP filename
-                    let webp_filename = image::to_webp_filename(&file_name);
-
-                    // Add compressed image to output ZIP with WebP extension
-                    zip_writer
-                        .start_file(&webp_filename, zip::write::FileOptions::default())
-                        .with_context(|| {
-                            format!("Failed to start file in output ZIP: {}", webp_filename)
+                    // Check if compression actually reduced size
+                    if compressed_size >= original_size && !always_compress {
+                        // Keep original file since compressed version is larger
+                        zip_writer
+                            .start_file(&file_name, zip::write::FileOptions::default())
+                            .with_context(|| {
+                                format!("Failed to start file in output ZIP: {}", file_name)
+                            })?;
+                        zip_writer.write_all(&image_data).with_context(|| {
+                            format!("Failed to write original image: {}", file_name)
                         })?;
-                    zip_writer.write_all(&compressed_data).with_context(|| {
-                        format!("Failed to write compressed image: {}", webp_filename)
-                    })?;
 
-                    // Track the conversion for content.xml updates
-                    image_conversions.insert(file_name.clone(), webp_filename.clone());
+                        kept_original_images += 1;
+                        image_original_size += original_size;
+                        image_compressed_size += original_size; // Track as "compressed" size for statistics
+                        total_output_size += original_size;
 
-                    processed_images += 1;
-                    image_original_size += original_size;
-                    image_compressed_size += compressed_size;
-                    total_output_size += compressed_size;
+                        logger.log(format!(
+                            "  Keeping original (compressed would be larger): {} bytes vs {} bytes",
+                            original_size,
+                            compressed_size
+                        ));
 
-                    logger.log(format!(
-                        "  Converted to WebP: {} bytes -> {} bytes ({:.1}% reduction)",
-                        original_size,
-                        compressed_size,
-                        (1.0 - compressed_size as f64 / original_size as f64) * 100.0
-                    ));
+                        // Do NOT track this conversion - content.xml will keep original path
+                    } else {
+                        // Use compressed version (either smaller or always_compress is set)
+                        let webp_filename = image::to_webp_filename(&file_name);
+
+                        // Add compressed image to output ZIP with WebP extension
+                        zip_writer
+                            .start_file(&webp_filename, zip::write::FileOptions::default())
+                            .with_context(|| {
+                                format!("Failed to start file in output ZIP: {}", webp_filename)
+                            })?;
+                        zip_writer.write_all(&compressed_data).with_context(|| {
+                            format!("Failed to write compressed image: {}", webp_filename)
+                        })?;
+
+                        // Track the conversion for content.xml updates
+                        image_conversions.insert(file_name.clone(), webp_filename.clone());
+
+                        processed_images += 1;
+                        image_original_size += original_size;
+                        image_compressed_size += compressed_size;
+                        total_output_size += compressed_size;
+
+                        if compressed_size >= original_size {
+                            logger.log(format!(
+                                "  Converted to WebP (forced): {} bytes -> {} bytes ({:.1}% increase)",
+                                original_size,
+                                compressed_size,
+                                (compressed_size as f64 / original_size as f64 - 1.0) * 100.0
+                            ));
+                        } else {
+                            logger.log(format!(
+                                "  Converted to WebP: {} bytes -> {} bytes ({:.1}% reduction)",
+                                original_size,
+                                compressed_size,
+                                (1.0 - compressed_size as f64 / original_size as f64) * 100.0
+                            ));
+                        }
+                    }
                 }
                 Err(e) => {
                     logger.log(format!("  Skipping {}: {}", file_name, e));
@@ -494,27 +529,60 @@ fn compress_pack(
             // Try to compress audio
             match audio::compress_audio_file(&audio_data, &file_name, audio_quality) {
                 Ok((compressed_data, original_size, compressed_size)) => {
-                    // Add compressed audio to output ZIP
-                    zip_writer
-                        .start_file(&file_name, zip::write::FileOptions::default())
-                        .with_context(|| {
-                            format!("Failed to start file in output ZIP: {}", file_name)
+                    // Check if compression actually reduced size
+                    if compressed_size >= original_size && !always_compress {
+                        // Keep original file since compressed version is larger
+                        zip_writer
+                            .start_file(&file_name, zip::write::FileOptions::default())
+                            .with_context(|| {
+                                format!("Failed to start file in output ZIP: {}", file_name)
+                            })?;
+                        zip_writer.write_all(&audio_data).with_context(|| {
+                            format!("Failed to write original audio: {}", file_name)
                         })?;
-                    zip_writer.write_all(&compressed_data).with_context(|| {
-                        format!("Failed to write compressed audio: {}", file_name)
-                    })?;
 
-                    processed_audio += 1;
-                    audio_original_size += original_size;
-                    audio_compressed_size += compressed_size;
-                    total_output_size += compressed_size;
+                        kept_original_audio += 1;
+                        audio_original_size += original_size;
+                        audio_compressed_size += original_size; // Track as "compressed" size for statistics
+                        total_output_size += original_size;
 
-                    logger.log(format!(
-                        "  MP3 compressed: {} bytes -> {} bytes ({:.1}% reduction)",
-                        original_size,
-                        compressed_size,
-                        (1.0 - compressed_size as f64 / original_size as f64) * 100.0
-                    ));
+                        logger.log(format!(
+                            "  Keeping original (compressed would be larger): {} bytes vs {} bytes",
+                            original_size,
+                            compressed_size
+                        ));
+                    } else {
+                        // Use compressed version (either smaller or always_compress is set)
+                        zip_writer
+                            .start_file(&file_name, zip::write::FileOptions::default())
+                            .with_context(|| {
+                                format!("Failed to start file in output ZIP: {}", file_name)
+                            })?;
+                        zip_writer.write_all(&compressed_data).with_context(|| {
+                            format!("Failed to write compressed audio: {}", file_name)
+                        })?;
+
+                        processed_audio += 1;
+                        audio_original_size += original_size;
+                        audio_compressed_size += compressed_size;
+                        total_output_size += compressed_size;
+
+                        if compressed_size >= original_size {
+                            logger.log(format!(
+                                "  MP3 compressed (forced): {} bytes -> {} bytes ({:.1}% increase)",
+                                original_size,
+                                compressed_size,
+                                (compressed_size as f64 / original_size as f64 - 1.0) * 100.0
+                            ));
+                        } else {
+                            logger.log(format!(
+                                "  MP3 compressed: {} bytes -> {} bytes ({:.1}% reduction)",
+                                original_size,
+                                compressed_size,
+                                (1.0 - compressed_size as f64 / original_size as f64) * 100.0
+                            ));
+                        }
+                    }
                 }
                 Err(e) => {
                     logger.log(format!("  Skipping {}: {}", file_name, e));
@@ -582,27 +650,61 @@ fn compress_pack(
                         for log_msg in log_messages {
                             logger.log(log_msg);
                         }
-                        // Add compressed video to output ZIP
-                        zip_writer
-                            .start_file(&file_name, zip::write::FileOptions::default())
-                            .with_context(|| {
-                                format!("Failed to start file in output ZIP: {}", file_name)
+
+                        // Check if compression actually reduced size
+                        if compressed_size >= original_size && !always_compress {
+                            // Keep original file since compressed version is larger
+                            zip_writer
+                                .start_file(&file_name, zip::write::FileOptions::default())
+                                .with_context(|| {
+                                    format!("Failed to start file in output ZIP: {}", file_name)
+                                })?;
+                            zip_writer.write_all(&video_data).with_context(|| {
+                                format!("Failed to write original video: {}", file_name)
                             })?;
-                        zip_writer.write_all(&compressed_data).with_context(|| {
-                            format!("Failed to write compressed video: {}", file_name)
-                        })?;
 
-                        processed_video += 1;
-                        video_original_size += original_size;
-                        video_compressed_size += compressed_size;
-                        total_output_size += compressed_size;
+                            kept_original_video += 1;
+                            video_original_size += original_size;
+                            video_compressed_size += original_size; // Track as "compressed" size for statistics
+                            total_output_size += original_size;
 
-                        logger.log(format!(
-                            "  HEVC compressed: {} -> {} ({:.1}% reduction)",
-                            format_size(original_size),
-                            format_size(compressed_size),
-                            (1.0 - compressed_size as f64 / original_size as f64) * 100.0
-                        ));
+                            logger.log(format!(
+                                "  Keeping original (compressed would be larger): {} vs {}",
+                                format_size(original_size),
+                                format_size(compressed_size)
+                            ));
+                        } else {
+                            // Use compressed version (either smaller or always_compress is set)
+                            zip_writer
+                                .start_file(&file_name, zip::write::FileOptions::default())
+                                .with_context(|| {
+                                    format!("Failed to start file in output ZIP: {}", file_name)
+                                })?;
+                            zip_writer.write_all(&compressed_data).with_context(|| {
+                                format!("Failed to write compressed video: {}", file_name)
+                            })?;
+
+                            processed_video += 1;
+                            video_original_size += original_size;
+                            video_compressed_size += compressed_size;
+                            total_output_size += compressed_size;
+
+                            if compressed_size >= original_size {
+                                logger.log(format!(
+                                    "  HEVC compressed (forced): {} -> {} ({:.1}% increase)",
+                                    format_size(original_size),
+                                    format_size(compressed_size),
+                                    (compressed_size as f64 / original_size as f64 - 1.0) * 100.0
+                                ));
+                            } else {
+                                logger.log(format!(
+                                    "  HEVC compressed: {} -> {} ({:.1}% reduction)",
+                                    format_size(original_size),
+                                    format_size(compressed_size),
+                                    (1.0 - compressed_size as f64 / original_size as f64) * 100.0
+                                ));
+                            }
+                        }
                     }
                     Err(e) => {
                         logger.log(format!(
@@ -779,6 +881,7 @@ fn compress_pack(
     // Images statistics
     println!("\nImages:");
     println!("  Processed: {}", processed_images);
+    println!("  Kept original (due to size): {}", kept_original_images);
     println!("  Skipped: {}", skipped_images);
     if image_original_size > 0 {
         println!(
@@ -792,6 +895,7 @@ fn compress_pack(
     // Audio statistics
     println!("\nAudio:");
     println!("  Processed: {}", processed_audio);
+    println!("  Kept original (due to size): {}", kept_original_audio);
     println!("  Skipped: {}", skipped_audio);
     if audio_original_size > 0 {
         if audio_compressed_size > 0 {
@@ -812,6 +916,7 @@ fn compress_pack(
     // Video statistics
     println!("\nVideo:");
     println!("  Processed: {}", processed_video);
+    println!("  Kept original (due to size): {}", kept_original_video);
     println!("  Skipped: {}", skipped_video);
     if video_original_size > 0 {
         if video_compressed_size > 0 {
