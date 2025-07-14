@@ -424,7 +424,7 @@ fn compress_pack(
 
             // We'll write content.xml after processing all images
             logger.log("  Stored content.xml for path updates".to_string());
-        } else if is_image {
+        } else if is_image && !skip_image {
             // Read image data
             let mut image_data = Vec::new();
             file.read_to_end(&mut image_data)
@@ -517,7 +517,37 @@ fn compress_pack(
                     // Do NOT track this conversion - content.xml will keep original path
                 }
             }
-        } else if is_audio {
+        } else if is_image && skip_image {
+            // Skip image compression - copy original file unchanged
+            let mut image_data = Vec::new();
+            file.read_to_end(&mut image_data)
+                .with_context(|| format!("Failed to read image data: {}", file_name))?;
+
+            // Track input size
+            total_input_size += image_data.len() as u64;
+
+            logger.log(format!(
+                "  Skipping image compression (skip_image flag): {}",
+                file_name
+            ));
+
+            // Copy original file unchanged (keep original extension)
+            zip_writer
+                .start_file(&file_name, zip::write::FileOptions::default())
+                .with_context(|| {
+                    format!("Failed to start file in output ZIP: {}", file_name)
+                })?;
+            zip_writer
+                .write_all(&image_data)
+                .with_context(|| format!("Failed to write original image: {}", file_name))?;
+
+            skipped_images += 1;
+            image_original_size += image_data.len() as u64;
+            image_compressed_size += image_data.len() as u64; // No compression applied
+            total_output_size += image_data.len() as u64;
+
+            // Do NOT track this conversion - content.xml will keep original path
+        } else if is_audio && !skip_audio {
             // Read audio data
             let mut audio_data = Vec::new();
             file.read_to_end(&mut audio_data)
@@ -604,6 +634,34 @@ fn compress_pack(
                     total_output_size += audio_data.len() as u64;
                 }
             }
+        } else if is_audio && skip_audio {
+            // Skip audio compression - copy original file unchanged
+            let mut audio_data = Vec::new();
+            file.read_to_end(&mut audio_data)
+                .with_context(|| format!("Failed to read audio data: {}", file_name))?;
+
+            // Track input size
+            total_input_size += audio_data.len() as u64;
+
+            logger.log(format!(
+                "  Skipping audio compression (skip_audio flag): {}",
+                file_name
+            ));
+
+            // Copy original file unchanged
+            zip_writer
+                .start_file(&file_name, zip::write::FileOptions::default())
+                .with_context(|| {
+                    format!("Failed to start file in output ZIP: {}", file_name)
+                })?;
+            zip_writer.write_all(&audio_data).with_context(|| {
+                format!("Failed to write original audio file: {}", file_name)
+            })?;
+
+            skipped_audio += 1;
+            audio_original_size += audio_data.len() as u64;
+            audio_compressed_size += audio_data.len() as u64; // No compression applied
+            total_output_size += audio_data.len() as u64;
         } else if is_video {
             // Read video data
             let mut video_data = Vec::new();
