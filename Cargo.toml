@@ -19,6 +19,7 @@ mp3lame-encoder = "0.1"
 symphonia = { version = "0.5", features = ["all"] }
 urlencoding = "2.1"
 ffmpeg-sidecar = "2.0"
+ffprobe = "0.4"
 log = "0.4"
 env_logger = "0.10"
 

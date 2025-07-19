@@ -4,7 +4,6 @@ use ffmpeg_sidecar::event::{FfmpegEvent, LogLevel};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::process::Command;
 use tempfile::NamedTempFile;
 
 /// Supported video formats
@@ -21,7 +20,7 @@ pub enum VideoFormat {
 #[derive(Debug, Clone)]
 struct VideoMetadata {
     total_frames: Option<u32>,
-    duration_seconds: f64,  // Always available from ffprobe
+    duration_seconds: Option<f64>,  // May not be available - be honest about it
     fps: Option<f32>,
 }
 
@@ -70,76 +69,66 @@ fn get_ffmpeg_format(format: VideoFormat) -> &'static str {
     }
 }
 
-/// Extract video metadata using ffprobe for accurate progress calculation
-fn extract_video_metadata(file_path: &Path, ffmpeg_path: Option<&Path>) -> VideoMetadata {
-    let ffprobe_cmd = if let Some(ffmpeg_path) = ffmpeg_path {
-        // If custom ffmpeg path is provided, try to find ffprobe in the same directory
-        let ffmpeg_dir = ffmpeg_path.parent().unwrap_or(Path::new("."));
-        ffmpeg_dir.join("ffprobe")
-    } else {
-        Path::new("ffprobe").to_path_buf()
-    };
-
-    // Run ffprobe to get video stream information
-    let output = Command::new(&ffprobe_cmd)
-        .args([
-            "-v", "quiet",           // Suppress ffprobe output
-            "-print_format", "csv",  // CSV output format
-            "-show_entries", "stream=nb_frames,duration,r_frame_rate", // Get frames, duration, fps
-            "-select_streams", "v:0", // Select first video stream
-            file_path.to_string_lossy().as_ref(),
-        ])
-        .output();
-
+/// Extract video metadata using ffprobe-rs for accurate progress calculation
+fn extract_video_metadata(file_path: &Path, _ffmpeg_path: Option<&Path>) -> VideoMetadata {
+    // Use ffprobe-rs to get structured video metadata
+    let probe_result = ffprobe::ffprobe(file_path);
+    
     let mut metadata = VideoMetadata {
         total_frames: None,
-        duration_seconds: 0.0,  // Will be set from ffprobe or use fallback
+        duration_seconds: None,  // Will be set from ffprobe if available
         fps: None,
     };
 
-    if let Ok(output) = output {
-        if output.status.success() {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            
-            // Parse CSV output: stream,nb_frames,duration,r_frame_rate
-            for line in output_str.lines() {
-                if line.starts_with("stream,") {
-                    let parts: Vec<&str> = line.split(',').collect();
-                    if parts.len() >= 4 {
-                        // Parse nb_frames (index 1)
-                        if let Ok(frames) = parts[1].parse::<u32>() {
-                            metadata.total_frames = Some(frames);
-                        }
-                        
-                        // Parse duration (index 2)
-                        if let Ok(duration) = parts[2].parse::<f64>() {
-                            metadata.duration_seconds = duration;
-                        }
-                        
-                        // Parse frame rate (index 3) - format is "num/den"
-                        if let Some((num_str, den_str)) = parts[3].split_once('/') {
-                            if let (Ok(num), Ok(den)) = (num_str.parse::<f32>(), den_str.parse::<f32>()) {
-                                if den != 0.0 {
-                                    metadata.fps = Some(num / den);
-                                }
-                            }
+    match probe_result {
+        Ok(probe_data) => {
+            // Find the first video stream
+            if let Some(video_stream) = probe_data.streams.iter().find(|s| {
+                s.codec_type.as_ref().is_some_and(|t| t == "video")
+            }) {
+                // Extract frame count (nb_frames)
+                if let Some(nb_frames_str) = &video_stream.nb_frames {
+                    if let Ok(frames) = nb_frames_str.parse::<u32>() {
+                        metadata.total_frames = Some(frames);
+                    }
+                }
+
+                // Extract duration from stream (prefer) or format
+                let duration_str = video_stream.duration.as_ref()
+                    .or(probe_data.format.duration.as_ref());
+                
+                if let Some(duration_str) = duration_str {
+                    if let Ok(duration) = duration_str.parse::<f64>() {
+                        metadata.duration_seconds = Some(duration);
+                    }
+                }
+
+                // Extract frame rate - prefer avg_frame_rate for better accuracy
+                let frame_rate_str = if !video_stream.avg_frame_rate.is_empty() && video_stream.avg_frame_rate != "0/0" {
+                    &video_stream.avg_frame_rate
+                } else {
+                    &video_stream.r_frame_rate
+                };
+
+                // Parse frame rate (format: "num/den")
+                if let Some((num_str, den_str)) = frame_rate_str.split_once('/') {
+                    if let (Ok(num), Ok(den)) = (num_str.parse::<f32>(), den_str.parse::<f32>()) {
+                        if den != 0.0 {
+                            metadata.fps = Some(num / den);
                         }
                     }
-                    break;
                 }
             }
         }
-    }
-
-    // If duration is still 0.0, use a reasonable fallback (rare edge case)
-    if metadata.duration_seconds == 0.0 {
-        metadata.duration_seconds = 30.0; // Default to 30 seconds for unknown duration
+        Err(_) => {
+            // ffprobe failed - metadata will use fallback values
+        }
     }
 
     // If nb_frames is not available but we have duration and fps, calculate it
     if metadata.total_frames.is_none() {
-        if let Some(fps) = metadata.fps {
-            metadata.total_frames = Some((metadata.duration_seconds * fps as f64) as u32);
+        if let (Some(duration), Some(fps)) = (metadata.duration_seconds, metadata.fps) {
+            metadata.total_frames = Some((duration * fps as f64) as u32);
         }
     }
 
@@ -183,9 +172,9 @@ fn calculate_video_progress(current_frame: u32, current_time: &str, metadata: &V
     }
     
     // Fallback method: Time-based progress using duration
-    if let Some(current_seconds) = parse_ffmpeg_time_to_seconds(current_time) {
-        if metadata.duration_seconds > 0.0 {
-            let progress = (current_seconds / metadata.duration_seconds * 100.0).min(100.0);
+    if let (Some(current_seconds), Some(duration)) = (parse_ffmpeg_time_to_seconds(current_time), metadata.duration_seconds) {
+        if duration > 0.0 {
+            let progress = (current_seconds / duration * 100.0).min(100.0);
             return Some(progress as u64);
         }
     }
@@ -453,7 +442,7 @@ mod tests {
         // Test frame-based progress (primary method)
         let metadata_with_frames = VideoMetadata {
             total_frames: Some(1000),
-            duration_seconds: 40.0,
+            duration_seconds: Some(40.0),
             fps: Some(25.0),
         };
         
@@ -470,7 +459,7 @@ mod tests {
         // Test time-based progress (fallback method when no frame count)
         let metadata_no_frames = VideoMetadata {
             total_frames: None,
-            duration_seconds: 60.0,  // 1 minute video
+            duration_seconds: Some(60.0),  // 1 minute video
             fps: Some(30.0),
         };
         
@@ -487,7 +476,7 @@ mod tests {
         // Test edge case: no frames and invalid time
         let metadata_edge_case = VideoMetadata {
             total_frames: None,
-            duration_seconds: 30.0,
+            duration_seconds: Some(30.0),
             fps: None,
         };
         
@@ -495,15 +484,18 @@ mod tests {
         assert_eq!(calculate_video_progress(0, "invalid", &metadata_edge_case), None);     // No progress
         assert_eq!(calculate_video_progress(100, "invalid", &metadata_edge_case), None);   // No progress
         
-        // Zero duration edge case
-        let metadata_zero_duration = VideoMetadata {
+        // No duration edge case - completely unknown metadata
+        let metadata_no_duration = VideoMetadata {
             total_frames: None,
-            duration_seconds: 0.0,
+            duration_seconds: None,
             fps: None,
         };
         
-        assert_eq!(calculate_video_progress(0, "00:00:10.00", &metadata_zero_duration), None);   // No progress
-        assert_eq!(calculate_video_progress(100, "00:00:10.00", &metadata_zero_duration), None); // No progress
+        assert_eq!(calculate_video_progress(0, "00:00:10.00", &metadata_no_duration), None);   // No progress
+        assert_eq!(calculate_video_progress(100, "00:00:10.00", &metadata_no_duration), None); // No progress
+        
+        // Test completely unknown metadata with valid time - should still return None
+        assert_eq!(calculate_video_progress(50, "00:00:05.00", &metadata_no_duration), None);  // No progress even with valid time
     }
 
     #[test]
@@ -511,7 +503,7 @@ mod tests {
         // Test short video (5 seconds at 30fps = 150 frames)
         let short_video = VideoMetadata {
             total_frames: Some(150),
-            duration_seconds: 5.0,
+            duration_seconds: Some(5.0),
             fps: Some(30.0),
         };
         
@@ -522,7 +514,7 @@ mod tests {
         // Test long video (2 minutes at 24fps = 2880 frames)
         let long_video = VideoMetadata {
             total_frames: Some(2880),
-            duration_seconds: 120.0,
+            duration_seconds: Some(120.0),
             fps: Some(24.0),
         };
         
@@ -535,13 +527,13 @@ mod tests {
         // Test calculated frames from duration and fps
         let mut calculated_frames = VideoMetadata {
             total_frames: None,
-            duration_seconds: 10.0,
+            duration_seconds: Some(10.0),
             fps: Some(25.0),
         };
         
         // Manually calculate frames as extract_video_metadata would do
-        if let Some(fps) = calculated_frames.fps {
-            calculated_frames.total_frames = Some((calculated_frames.duration_seconds * fps as f64) as u32);
+        if let (Some(duration), Some(fps)) = (calculated_frames.duration_seconds, calculated_frames.fps) {
+            calculated_frames.total_frames = Some((duration * fps as f64) as u32);
         }
         
         // Should now have 250 frames calculated and use that for progress
