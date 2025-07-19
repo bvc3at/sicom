@@ -21,7 +21,7 @@ pub enum VideoFormat {
 #[derive(Debug, Clone)]
 struct VideoMetadata {
     total_frames: Option<u32>,
-    duration_seconds: Option<f64>,
+    duration_seconds: f64,  // Always available from ffprobe
     fps: Option<f32>,
 }
 
@@ -93,7 +93,7 @@ fn extract_video_metadata(file_path: &Path, ffmpeg_path: Option<&Path>) -> Video
 
     let mut metadata = VideoMetadata {
         total_frames: None,
-        duration_seconds: None,
+        duration_seconds: 0.0,  // Will be set from ffprobe or use fallback
         fps: None,
     };
 
@@ -113,7 +113,7 @@ fn extract_video_metadata(file_path: &Path, ffmpeg_path: Option<&Path>) -> Video
                         
                         // Parse duration (index 2)
                         if let Ok(duration) = parts[2].parse::<f64>() {
-                            metadata.duration_seconds = Some(duration);
+                            metadata.duration_seconds = duration;
                         }
                         
                         // Parse frame rate (index 3) - format is "num/den"
@@ -131,29 +131,67 @@ fn extract_video_metadata(file_path: &Path, ffmpeg_path: Option<&Path>) -> Video
         }
     }
 
+    // If duration is still 0.0, use a reasonable fallback (rare edge case)
+    if metadata.duration_seconds == 0.0 {
+        metadata.duration_seconds = 30.0; // Default to 30 seconds for unknown duration
+    }
+
     // If nb_frames is not available but we have duration and fps, calculate it
     if metadata.total_frames.is_none() {
-        if let (Some(duration), Some(fps)) = (metadata.duration_seconds, metadata.fps) {
-            metadata.total_frames = Some((duration * fps as f64) as u32);
+        if let Some(fps) = metadata.fps {
+            metadata.total_frames = Some((metadata.duration_seconds * fps as f64) as u32);
         }
     }
 
     metadata
 }
 
-/// Calculate accurate video encoding progress based on frame count
-/// Returns progress percentage (0-100) based on current frame vs total frames
-fn calculate_video_progress(current_frame: u32, metadata: &VideoMetadata) -> u64 {
+/// Parse FFmpeg time string (e.g., "00:01:23.45") to seconds
+/// Handles both HH:MM:SS.MS and MM:SS.MS formats
+fn parse_ffmpeg_time_to_seconds(time_str: &str) -> Option<f64> {
+    let parts: Vec<&str> = time_str.split(':').collect();
+    
+    match parts.len() {
+        3 => {
+            // HH:MM:SS.MS format
+            let hours: f64 = parts[0].parse().ok()?;
+            let minutes: f64 = parts[1].parse().ok()?;
+            let seconds: f64 = parts[2].parse().ok()?;
+            Some(hours * 3600.0 + minutes * 60.0 + seconds)
+        },
+        2 => {
+            // MM:SS.MS format
+            let minutes: f64 = parts[0].parse().ok()?;
+            let seconds: f64 = parts[1].parse().ok()?;
+            Some(minutes * 60.0 + seconds)
+        },
+        _ => None, // Invalid format
+    }
+}
+
+/// Calculate accurate video encoding progress with hybrid approach
+/// Primary: Frame-based progress when frame count is available
+/// Fallback: Time-based progress using video duration
+/// Returns Some(percentage) for accurate progress, None for indeterminate activity
+fn calculate_video_progress(current_frame: u32, current_time: &str, metadata: &VideoMetadata) -> Option<u64> {
+    // Primary method: Frame-based progress (most accurate)
     if let Some(total_frames) = metadata.total_frames {
         if total_frames > 0 {
             let progress = (current_frame as f64 / total_frames as f64 * 100.0).min(100.0);
-            return progress as u64;
+            return Some(progress as u64);
         }
     }
     
-    // Fallback: use indeterminate progress - just show activity without percentage
-    // For now, return a low value to indicate activity but unknown progress
-    if current_frame > 0 { 5 } else { 0 }
+    // Fallback method: Time-based progress using duration
+    if let Some(current_seconds) = parse_ffmpeg_time_to_seconds(current_time) {
+        if metadata.duration_seconds > 0.0 {
+            let progress = (current_seconds / metadata.duration_seconds * 100.0).min(100.0);
+            return Some(progress as u64);
+        }
+    }
+    
+    // Cannot calculate accurate progress - return None for indeterminate activity
+    None
 }
 
 /// Map quality (1-100) to x265 CRF value (0-51)
@@ -295,10 +333,18 @@ pub fn compress_video_file(
                 }
             },
             FfmpegEvent::Progress(progress) => {
-                // Update video progress bar based on frame count
+                // Update video progress bar using hybrid frame/time-based calculation
                 if let Some(video_bar) = &logger.video_progress_bar {
-                    let progress_percent = calculate_video_progress(progress.frame, &metadata);
-                    video_bar.set_position(progress_percent);
+                    match calculate_video_progress(progress.frame, &progress.time, &metadata) {
+                        Some(progress_percent) => {
+                            // Accurate progress available - set position
+                            video_bar.set_position(progress_percent);
+                        },
+                        None => {
+                            // No accurate progress - show indeterminate activity
+                            video_bar.tick();
+                        }
+                    }
                 }
             },
             FfmpegEvent::Done => break,
@@ -386,31 +432,78 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_video_progress() {
-        // Test with known total frames
+    fn test_parse_ffmpeg_time_to_seconds() {
+        // Test HH:MM:SS.MS format
+        assert_eq!(parse_ffmpeg_time_to_seconds("00:01:30.50"), Some(90.5));   // 1min 30.5sec = 90.5sec
+        assert_eq!(parse_ffmpeg_time_to_seconds("01:02:15.25"), Some(3735.25)); // 1h 2min 15.25sec
+        assert_eq!(parse_ffmpeg_time_to_seconds("00:00:00.00"), Some(0.0));     // Start time
+
+        // Test MM:SS.MS format
+        assert_eq!(parse_ffmpeg_time_to_seconds("02:30.75"), Some(150.75));     // 2min 30.75sec
+        assert_eq!(parse_ffmpeg_time_to_seconds("00:15.50"), Some(15.5));       // 15.5 seconds
+
+        // Test invalid formats
+        assert_eq!(parse_ffmpeg_time_to_seconds("invalid"), None);
+        assert_eq!(parse_ffmpeg_time_to_seconds(""), None);
+        assert_eq!(parse_ffmpeg_time_to_seconds("1:2:3:4"), None);              // Too many parts
+    }
+
+    #[test]
+    fn test_calculate_video_progress_frame_based() {
+        // Test frame-based progress (primary method)
         let metadata_with_frames = VideoMetadata {
             total_frames: Some(1000),
-            duration_seconds: Some(40.0),
+            duration_seconds: 40.0,
             fps: Some(25.0),
         };
         
-        assert_eq!(calculate_video_progress(0, &metadata_with_frames), 0);      // 0% at start
-        assert_eq!(calculate_video_progress(250, &metadata_with_frames), 25);   // 25% at 1/4
-        assert_eq!(calculate_video_progress(500, &metadata_with_frames), 50);   // 50% at half
-        assert_eq!(calculate_video_progress(750, &metadata_with_frames), 75);   // 75% at 3/4
-        assert_eq!(calculate_video_progress(1000, &metadata_with_frames), 100); // 100% at end
-        assert_eq!(calculate_video_progress(1200, &metadata_with_frames), 100); // Capped at 100%
+        assert_eq!(calculate_video_progress(0, "00:00:00.00", &metadata_with_frames), Some(0));      // 0% at start
+        assert_eq!(calculate_video_progress(250, "00:00:10.00", &metadata_with_frames), Some(25));   // 25% at 1/4
+        assert_eq!(calculate_video_progress(500, "00:00:20.00", &metadata_with_frames), Some(50));   // 50% at half
+        assert_eq!(calculate_video_progress(750, "00:00:30.00", &metadata_with_frames), Some(75));   // 75% at 3/4
+        assert_eq!(calculate_video_progress(1000, "00:00:40.00", &metadata_with_frames), Some(100)); // 100% at end
+        assert_eq!(calculate_video_progress(1200, "00:00:48.00", &metadata_with_frames), Some(100)); // Capped at 100%
+    }
 
-        // Test with no frame count available
+    #[test]
+    fn test_calculate_video_progress_time_based() {
+        // Test time-based progress (fallback method when no frame count)
         let metadata_no_frames = VideoMetadata {
             total_frames: None,
-            duration_seconds: Some(40.0),
-            fps: Some(25.0),
+            duration_seconds: 60.0,  // 1 minute video
+            fps: Some(30.0),
         };
         
-        assert_eq!(calculate_video_progress(0, &metadata_no_frames), 0);    // No activity
-        assert_eq!(calculate_video_progress(100, &metadata_no_frames), 5);  // Some activity
-        assert_eq!(calculate_video_progress(500, &metadata_no_frames), 5);  // Consistent fallback
+        assert_eq!(calculate_video_progress(0, "00:00:00.00", &metadata_no_frames), Some(0));    // 0% at start
+        assert_eq!(calculate_video_progress(100, "00:00:15.00", &metadata_no_frames), Some(25)); // 25% at 15 seconds
+        assert_eq!(calculate_video_progress(200, "00:00:30.00", &metadata_no_frames), Some(50)); // 50% at 30 seconds
+        assert_eq!(calculate_video_progress(300, "00:00:45.00", &metadata_no_frames), Some(75)); // 75% at 45 seconds
+        assert_eq!(calculate_video_progress(400, "00:01:00.00", &metadata_no_frames), Some(100)); // 100% at end
+        assert_eq!(calculate_video_progress(500, "00:01:15.00", &metadata_no_frames), Some(100)); // Capped at 100%
+    }
+
+    #[test]
+    fn test_calculate_video_progress_edge_cases() {
+        // Test edge case: no frames and invalid time
+        let metadata_edge_case = VideoMetadata {
+            total_frames: None,
+            duration_seconds: 30.0,
+            fps: None,
+        };
+        
+        // Invalid time format should return None for indeterminate progress
+        assert_eq!(calculate_video_progress(0, "invalid", &metadata_edge_case), None);     // No progress
+        assert_eq!(calculate_video_progress(100, "invalid", &metadata_edge_case), None);   // No progress
+        
+        // Zero duration edge case
+        let metadata_zero_duration = VideoMetadata {
+            total_frames: None,
+            duration_seconds: 0.0,
+            fps: None,
+        };
+        
+        assert_eq!(calculate_video_progress(0, "00:00:10.00", &metadata_zero_duration), None);   // No progress
+        assert_eq!(calculate_video_progress(100, "00:00:10.00", &metadata_zero_duration), None); // No progress
     }
 
     #[test]
@@ -418,40 +511,40 @@ mod tests {
         // Test short video (5 seconds at 30fps = 150 frames)
         let short_video = VideoMetadata {
             total_frames: Some(150),
-            duration_seconds: Some(5.0),
+            duration_seconds: 5.0,
             fps: Some(30.0),
         };
         
-        assert_eq!(calculate_video_progress(0, &short_video), 0);      // 0% at start
-        assert_eq!(calculate_video_progress(75, &short_video), 50);    // 50% at half
-        assert_eq!(calculate_video_progress(150, &short_video), 100);  // 100% at end
+        assert_eq!(calculate_video_progress(0, "00:00:00.00", &short_video), Some(0));      // 0% at start
+        assert_eq!(calculate_video_progress(75, "00:00:02.50", &short_video), Some(50));    // 50% at half
+        assert_eq!(calculate_video_progress(150, "00:00:05.00", &short_video), Some(100));  // 100% at end
         
         // Test long video (2 minutes at 24fps = 2880 frames)
         let long_video = VideoMetadata {
             total_frames: Some(2880),
-            duration_seconds: Some(120.0),
+            duration_seconds: 120.0,
             fps: Some(24.0),
         };
         
-        assert_eq!(calculate_video_progress(0, &long_video), 0);       // 0% at start
-        assert_eq!(calculate_video_progress(720, &long_video), 25);    // 25% at 1/4
-        assert_eq!(calculate_video_progress(1440, &long_video), 50);   // 50% at half
-        assert_eq!(calculate_video_progress(2160, &long_video), 75);   // 75% at 3/4
-        assert_eq!(calculate_video_progress(2880, &long_video), 100);  // 100% at end
+        assert_eq!(calculate_video_progress(0, "00:00:00.00", &long_video), Some(0));       // 0% at start
+        assert_eq!(calculate_video_progress(720, "00:00:30.00", &long_video), Some(25));    // 25% at 1/4
+        assert_eq!(calculate_video_progress(1440, "00:01:00.00", &long_video), Some(50));   // 50% at half
+        assert_eq!(calculate_video_progress(2160, "00:01:30.00", &long_video), Some(75));   // 75% at 3/4
+        assert_eq!(calculate_video_progress(2880, "00:02:00.00", &long_video), Some(100));  // 100% at end
         
         // Test calculated frames from duration and fps
         let mut calculated_frames = VideoMetadata {
             total_frames: None,
-            duration_seconds: Some(10.0),
+            duration_seconds: 10.0,
             fps: Some(25.0),
         };
         
         // Manually calculate frames as extract_video_metadata would do
-        if let (Some(duration), Some(fps)) = (calculated_frames.duration_seconds, calculated_frames.fps) {
-            calculated_frames.total_frames = Some((duration * fps as f64) as u32);
+        if let Some(fps) = calculated_frames.fps {
+            calculated_frames.total_frames = Some((calculated_frames.duration_seconds * fps as f64) as u32);
         }
         
         // Should now have 250 frames calculated and use that for progress
-        assert_eq!(calculate_video_progress(125, &calculated_frames), 50);  // 50% progress
+        assert_eq!(calculate_video_progress(125, "00:00:05.00", &calculated_frames), Some(50));  // 50% progress
     }
 }
