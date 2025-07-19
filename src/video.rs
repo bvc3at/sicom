@@ -4,6 +4,7 @@ use ffmpeg_sidecar::event::{FfmpegEvent, LogLevel};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use std::process::Command;
 use tempfile::NamedTempFile;
 
 /// Supported video formats
@@ -14,6 +15,14 @@ pub enum VideoFormat {
     Avi,
     Mkv,
     // Future formats can be added here
+}
+
+/// Video metadata for progress calculation
+#[derive(Debug, Clone)]
+struct VideoMetadata {
+    total_frames: Option<u32>,
+    duration_seconds: Option<f64>,
+    fps: Option<f32>,
 }
 
 /// Check if a video file format is supported
@@ -61,33 +70,90 @@ fn get_ffmpeg_format(format: VideoFormat) -> &'static str {
     }
 }
 
-/// Parse FFmpeg time string (e.g., "00:01:23.45") to seconds
-/// Returns approximate progress percentage (0-100) based on heuristics
-/// Since we don't know total duration, we estimate based on time elapsed
-fn parse_time_to_progress_percent(time_str: &str) -> u64 {
-    // Parse time format: HH:MM:SS.MS or MM:SS.MS
-    let parts: Vec<&str> = time_str.split(':').collect();
-    let total_seconds = match parts.len() {
-        3 => {
-            // HH:MM:SS.MS format
-            let hours: f64 = parts[0].parse().unwrap_or(0.0);
-            let minutes: f64 = parts[1].parse().unwrap_or(0.0);
-            let seconds: f64 = parts[2].parse().unwrap_or(0.0);
-            hours * 3600.0 + minutes * 60.0 + seconds
-        },
-        2 => {
-            // MM:SS.MS format
-            let minutes: f64 = parts[0].parse().unwrap_or(0.0);
-            let seconds: f64 = parts[1].parse().unwrap_or(0.0);
-            minutes * 60.0 + seconds
-        },
-        _ => return 0, // Invalid format
+/// Extract video metadata using ffprobe for accurate progress calculation
+fn extract_video_metadata(file_path: &Path, ffmpeg_path: Option<&Path>) -> VideoMetadata {
+    let ffprobe_cmd = if let Some(ffmpeg_path) = ffmpeg_path {
+        // If custom ffmpeg path is provided, try to find ffprobe in the same directory
+        let ffmpeg_dir = ffmpeg_path.parent().unwrap_or(Path::new("."));
+        ffmpeg_dir.join("ffprobe")
+    } else {
+        Path::new("ffprobe").to_path_buf()
     };
 
-    // Heuristic: assume most videos are 10-60 seconds for SIGame packs
-    // Map 0-60 seconds to 0-100% progress
-    let estimated_progress = (total_seconds / 60.0 * 100.0).min(100.0);
-    estimated_progress as u64
+    // Run ffprobe to get video stream information
+    let output = Command::new(&ffprobe_cmd)
+        .args([
+            "-v", "quiet",           // Suppress ffprobe output
+            "-print_format", "csv",  // CSV output format
+            "-show_entries", "stream=nb_frames,duration,r_frame_rate", // Get frames, duration, fps
+            "-select_streams", "v:0", // Select first video stream
+            file_path.to_string_lossy().as_ref(),
+        ])
+        .output();
+
+    let mut metadata = VideoMetadata {
+        total_frames: None,
+        duration_seconds: None,
+        fps: None,
+    };
+
+    if let Ok(output) = output {
+        if output.status.success() {
+            let output_str = String::from_utf8_lossy(&output.stdout);
+            
+            // Parse CSV output: stream,nb_frames,duration,r_frame_rate
+            for line in output_str.lines() {
+                if line.starts_with("stream,") {
+                    let parts: Vec<&str> = line.split(',').collect();
+                    if parts.len() >= 4 {
+                        // Parse nb_frames (index 1)
+                        if let Ok(frames) = parts[1].parse::<u32>() {
+                            metadata.total_frames = Some(frames);
+                        }
+                        
+                        // Parse duration (index 2)
+                        if let Ok(duration) = parts[2].parse::<f64>() {
+                            metadata.duration_seconds = Some(duration);
+                        }
+                        
+                        // Parse frame rate (index 3) - format is "num/den"
+                        if let Some((num_str, den_str)) = parts[3].split_once('/') {
+                            if let (Ok(num), Ok(den)) = (num_str.parse::<f32>(), den_str.parse::<f32>()) {
+                                if den != 0.0 {
+                                    metadata.fps = Some(num / den);
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // If nb_frames is not available but we have duration and fps, calculate it
+    if metadata.total_frames.is_none() {
+        if let (Some(duration), Some(fps)) = (metadata.duration_seconds, metadata.fps) {
+            metadata.total_frames = Some((duration * fps as f64) as u32);
+        }
+    }
+
+    metadata
+}
+
+/// Calculate accurate video encoding progress based on frame count
+/// Returns progress percentage (0-100) based on current frame vs total frames
+fn calculate_video_progress(current_frame: u32, metadata: &VideoMetadata) -> u64 {
+    if let Some(total_frames) = metadata.total_frames {
+        if total_frames > 0 {
+            let progress = (current_frame as f64 / total_frames as f64 * 100.0).min(100.0);
+            return progress as u64;
+        }
+    }
+    
+    // Fallback: use indeterminate progress - just show activity without percentage
+    // For now, return a low value to indicate activity but unknown progress
+    if current_frame > 0 { 5 } else { 0 }
 }
 
 /// Map quality (1-100) to x265 CRF value (0-51)
@@ -159,8 +225,15 @@ pub fn compress_video_file(
         return Err(anyhow!("Input temporary file does not exist: {}", input_path.display()));
     }
     
-    // Log file details for debugging
-    logger.log(format!("DEBUG: Input file size: {} bytes, path: {}", written_size, input_path.display()));
+    // Extract video metadata for accurate progress calculation
+    let metadata = extract_video_metadata(&input_path, ffmpeg_path);
+    
+    // Log video metadata for debugging
+    if let Some(frames) = metadata.total_frames {
+        logger.log(format!("Video metadata: {} frames", frames));
+    } else {
+        logger.log("Video metadata: frame count unavailable, using fallback progress".to_string());
+    }
 
     let output_temp =
         NamedTempFile::with_suffix(&file_extension).context("Failed to create temporary output file")?;
@@ -222,9 +295,9 @@ pub fn compress_video_file(
                 }
             },
             FfmpegEvent::Progress(progress) => {
-                // Update video progress bar based on time elapsed
+                // Update video progress bar based on frame count
                 if let Some(video_bar) = &logger.video_progress_bar {
-                    let progress_percent = parse_time_to_progress_percent(&progress.time);
+                    let progress_percent = calculate_video_progress(progress.frame, &metadata);
                     video_bar.set_position(progress_percent);
                 }
             },
@@ -313,23 +386,72 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_time_to_progress_percent() {
-        // Test HH:MM:SS.MS format
-        assert_eq!(parse_time_to_progress_percent("00:00:30.00"), 50); // 30 seconds = 50%
-        assert_eq!(parse_time_to_progress_percent("00:01:00.00"), 100); // 60 seconds = 100%
-        assert_eq!(parse_time_to_progress_percent("00:00:15.50"), 25); // 15.5 seconds ≈ 25%
+    fn test_calculate_video_progress() {
+        // Test with known total frames
+        let metadata_with_frames = VideoMetadata {
+            total_frames: Some(1000),
+            duration_seconds: Some(40.0),
+            fps: Some(25.0),
+        };
+        
+        assert_eq!(calculate_video_progress(0, &metadata_with_frames), 0);      // 0% at start
+        assert_eq!(calculate_video_progress(250, &metadata_with_frames), 25);   // 25% at 1/4
+        assert_eq!(calculate_video_progress(500, &metadata_with_frames), 50);   // 50% at half
+        assert_eq!(calculate_video_progress(750, &metadata_with_frames), 75);   // 75% at 3/4
+        assert_eq!(calculate_video_progress(1000, &metadata_with_frames), 100); // 100% at end
+        assert_eq!(calculate_video_progress(1200, &metadata_with_frames), 100); // Capped at 100%
 
-        // Test MM:SS.MS format
-        assert_eq!(parse_time_to_progress_percent("00:30.00"), 50); // 30 seconds = 50%
-        assert_eq!(parse_time_to_progress_percent("01:00.00"), 100); // 60 seconds = 100%
-        assert_eq!(parse_time_to_progress_percent("00:15.50"), 25); // 15.5 seconds ≈ 25%
+        // Test with no frame count available
+        let metadata_no_frames = VideoMetadata {
+            total_frames: None,
+            duration_seconds: Some(40.0),
+            fps: Some(25.0),
+        };
+        
+        assert_eq!(calculate_video_progress(0, &metadata_no_frames), 0);    // No activity
+        assert_eq!(calculate_video_progress(100, &metadata_no_frames), 5);  // Some activity
+        assert_eq!(calculate_video_progress(500, &metadata_no_frames), 5);  // Consistent fallback
+    }
 
-        // Test boundary cases
-        assert_eq!(parse_time_to_progress_percent("00:00:00.00"), 0); // 0 seconds = 0%
-        assert_eq!(parse_time_to_progress_percent("00:02:00.00"), 100); // 120 seconds capped at 100%
-
-        // Test invalid format
-        assert_eq!(parse_time_to_progress_percent("invalid"), 0);
-        assert_eq!(parse_time_to_progress_percent(""), 0);
+    #[test]
+    fn test_calculate_video_progress_different_lengths() {
+        // Test short video (5 seconds at 30fps = 150 frames)
+        let short_video = VideoMetadata {
+            total_frames: Some(150),
+            duration_seconds: Some(5.0),
+            fps: Some(30.0),
+        };
+        
+        assert_eq!(calculate_video_progress(0, &short_video), 0);      // 0% at start
+        assert_eq!(calculate_video_progress(75, &short_video), 50);    // 50% at half
+        assert_eq!(calculate_video_progress(150, &short_video), 100);  // 100% at end
+        
+        // Test long video (2 minutes at 24fps = 2880 frames)
+        let long_video = VideoMetadata {
+            total_frames: Some(2880),
+            duration_seconds: Some(120.0),
+            fps: Some(24.0),
+        };
+        
+        assert_eq!(calculate_video_progress(0, &long_video), 0);       // 0% at start
+        assert_eq!(calculate_video_progress(720, &long_video), 25);    // 25% at 1/4
+        assert_eq!(calculate_video_progress(1440, &long_video), 50);   // 50% at half
+        assert_eq!(calculate_video_progress(2160, &long_video), 75);   // 75% at 3/4
+        assert_eq!(calculate_video_progress(2880, &long_video), 100);  // 100% at end
+        
+        // Test calculated frames from duration and fps
+        let mut calculated_frames = VideoMetadata {
+            total_frames: None,
+            duration_seconds: Some(10.0),
+            fps: Some(25.0),
+        };
+        
+        // Manually calculate frames as extract_video_metadata would do
+        if let (Some(duration), Some(fps)) = (calculated_frames.duration_seconds, calculated_frames.fps) {
+            calculated_frames.total_frames = Some((duration * fps as f64) as u32);
+        }
+        
+        // Should now have 250 frames calculated and use that for progress
+        assert_eq!(calculate_video_progress(125, &calculated_frames), 50);  // 50% progress
     }
 }
