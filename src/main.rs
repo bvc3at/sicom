@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -263,6 +263,11 @@ impl ProgressLogger {
         // Finish video progress bar if still active
         self.finish_video_progress();
 
+        // Log remaining messages at debug level BEFORE clearing progress bars
+        for line in &self.log_lines {
+            debug!("{}", line);
+        }
+
         self.progress_bar.finish();
 
         // Clear all log bars
@@ -271,11 +276,6 @@ impl ProgressLogger {
         }
 
         self.progress_bar.finish_and_clear();
-
-        // Show any remaining logs normally
-        for line in &self.log_lines {
-            println!("{line}");
-        }
     }
 }
 
