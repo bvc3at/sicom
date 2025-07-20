@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use log::{debug, error, info, warn};
-use std::collections::{HashMap, VecDeque};
+use indicatif_log_bridge::LogWrapper;
+use log::{error, info, warn};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
@@ -178,17 +179,12 @@ pub enum SicomError {
 }
 
 struct ProgressLogger {
-    _multi_progress: MultiProgress, // Keep alive but prefix with _ to suppress warning
     progress_bar: ProgressBar,
     video_progress_bar: Option<ProgressBar>, // Video encoding progress
-    log_bars: Vec<ProgressBar>,
-    log_lines: VecDeque<String>,
-    max_lines: usize,
 }
 
 impl ProgressLogger {
-    fn new(total_files: u64) -> Self {
-        let multi_progress = MultiProgress::new();
+    fn new(total_files: u64, multi_progress: &MultiProgress) -> Self {
 
         // Create main progress bar
         let progress_bar = multi_progress.add(ProgressBar::new(total_files));
@@ -199,50 +195,24 @@ impl ProgressLogger {
                 .progress_chars("#>-"),
         );
 
-        // Create 6 log lines as progress bars without progress (just for text display)
-        let mut log_bars = Vec::new();
-        for _ in 0..6 {
-            let log_bar = multi_progress.add(ProgressBar::new(1));
-            log_bar.set_style(ProgressStyle::default_bar().template("{msg:.dim}").unwrap());
-            log_bar.finish(); // Hide the progress part, just show message
-            log_bars.push(log_bar);
-        }
-
         Self {
-            _multi_progress: multi_progress,
             progress_bar,
             video_progress_bar: None,
-            log_bars,
-            log_lines: VecDeque::new(),
-            max_lines: 6,
         }
     }
 
     fn log(&mut self, message: String) {
-        // Add new log line
-        self.log_lines.push_back(message);
-
-        // Remove old lines if we exceed the limit
-        while self.log_lines.len() > self.max_lines {
-            self.log_lines.pop_front();
-        }
-
-        // Update the log display bars
-        for (i, log_bar) in self.log_bars.iter().enumerate() {
-            if let Some(line) = self.log_lines.get(i) {
-                log_bar.set_message(line.clone());
-            } else {
-                log_bar.set_message(String::new());
-            }
-        }
+        // Use standard logging instead of custom rolling display
+        // indicatif-log-bridge will handle coordination with progress bars
+        info!("{}", message);
     }
 
     fn inc(&mut self) {
         self.progress_bar.inc(1);
     }
 
-    fn start_video_progress(&mut self, filename: &str) {
-        let video_bar = self._multi_progress.add(ProgressBar::new(100));
+    fn start_video_progress(&mut self, filename: &str, multi_progress: &MultiProgress) {
+        let video_bar = multi_progress.add(ProgressBar::new(100));
         video_bar.set_style(
             ProgressStyle::default_bar()
                 .template("{spinner:.blue} Encoding {msg}: [{wide_bar:.yellow/blue}] {percent}%")
@@ -263,18 +233,7 @@ impl ProgressLogger {
         // Finish video progress bar if still active
         self.finish_video_progress();
 
-        // Log remaining messages at debug level BEFORE clearing progress bars
-        for line in &self.log_lines {
-            debug!("{}", line);
-        }
-
-        self.progress_bar.finish();
-
-        // Clear all log bars
-        for log_bar in &self.log_bars {
-            log_bar.finish_and_clear();
-        }
-
+        // Finish and clear the main progress bar
         self.progress_bar.finish_and_clear();
     }
 }
@@ -357,7 +316,7 @@ const fn get_log_color(level: log::Level) -> &'static str {
 }
 
 fn main() {
-    // Initialize logger with custom grey time format, using stderr to not interfere with progress bar
+    // Initialize logger with indicatif-log-bridge to prevent log interference with progress bars
     let mut builder = env_logger::Builder::new();
     builder.target(env_logger::Target::Stderr);
 
@@ -401,7 +360,14 @@ fn main() {
         builder.parse_default_env();
     }
 
-    builder.init();
+    // Create logger and MultiProgress instance
+    let logger = builder.build();
+    let multi_progress = MultiProgress::new();
+
+    // Wrap logger and multi-progress with LogWrapper to coordinate log output and progress bars
+    LogWrapper::new(multi_progress.clone(), logger)
+        .try_init()
+        .expect("Failed to initialize logger");
 
     let cli = Cli::parse();
 
@@ -429,6 +395,7 @@ fn main() {
                 skip_video,
                 ffmpeg_path,
                 always_compress,
+                multi_progress,
             ) {
                 Ok(()) => {
                     // Success - exit normally
@@ -454,6 +421,7 @@ fn compress_pack(
     skip_video: bool,
     ffmpeg_path: Option<PathBuf>,
     always_compress: bool,
+    multi_progress: MultiProgress,
 ) -> Result<()> {
     // Validate input
     if !input_pack.exists() {
@@ -549,11 +517,9 @@ fn compress_pack(
 
     // Initialize progress logger
     let total_files = archive.len() as u64;
-    let mut logger = ProgressLogger::new(total_files);
+    let mut logger = ProgressLogger::new(total_files, &multi_progress);
 
-    // Temporarily raise log level during progress display to suppress verbose audio library logs
-    // This prevents Symphonia INFO logs from interfering with the progress bar
-    log::set_max_level(log::LevelFilter::Warn);
+    // Note: indicatif-log-bridge now handles coordination between log messages and progress bars
 
     // Process each file in the archive
     for i in 0..archive.len() {
@@ -820,7 +786,7 @@ fn compress_pack(
                 stats.add_skipped_video(video_data.len() as u64);
             } else {
                 // Try to compress video using ffmpeg-sidecar
-                logger.start_video_progress(&file_name);
+                logger.start_video_progress(&file_name, &multi_progress);
                 let video_result = video::compress_video_file(
                     &video_data,
                     &file_name,
@@ -1044,9 +1010,6 @@ fn compress_pack(
 
     // Finish progress logging and show final summary
     logger.finish();
-
-    // Restore original log level for final summary
-    log::set_max_level(log::LevelFilter::Info);
 
     info!("Compression complete!");
 
