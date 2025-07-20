@@ -308,6 +308,20 @@ const fn get_log_color(level: log::Level) -> &'static str {
     }
 }
 
+/// Get ANSI color code for log level with module-specific overrides
+fn get_log_color_with_module(level: log::Level, module_path: Option<&str>) -> &'static str {
+    // Special handling for Symphonia library messages
+    if let Some(module) = module_path {
+        if module.starts_with("symphonia") && level == log::Level::Info {
+            // Make Symphonia info messages gray to reduce visual noise
+            return "\x1b[90m"; // Grey
+        }
+    }
+
+    // Use default color for all other cases
+    get_log_color(level)
+}
+
 fn main() {
     // Initialize logger with indicatif-log-bridge to prevent log interference with progress bars
     let mut builder = env_logger::Builder::new();
@@ -333,8 +347,8 @@ fn main() {
         let minutes = (local_time / 60) % 60;
         let seconds = local_time % 60;
 
-        // Format with grey timestamp and color-coded message based on log level
-        let message_color = get_log_color(record.level());
+        // Format with grey timestamp and color-coded message based on log level and module
+        let message_color = get_log_color_with_module(record.level(), record.module_path());
         writeln!(
             buf,
             "\x1b[90m{:02}:{:02}:{:02}\x1b[0m {}{}\x1b[0m",
