@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -201,11 +201,6 @@ impl ProgressLogger {
         }
     }
 
-    fn log(&mut self, message: String) {
-        // Use standard logging instead of custom rolling display
-        // indicatif-log-bridge will handle coordination with progress bars
-        info!("{}", message);
-    }
 
     fn inc(&mut self) {
         self.progress_bar.inc(1);
@@ -533,7 +528,7 @@ fn compress_pack(
         let is_video = file_name.starts_with("Video/") && video::is_supported_video(&file_name);
         let is_content_xml = file_name == "content.xml";
 
-        logger.log(format!("Processing: {}", file_name));
+        info!("Processing: {}", file_name);
 
         if is_content_xml {
             // Read content.xml for later processing
@@ -547,7 +542,7 @@ fn compress_pack(
             content_xml_data = Some(xml_data);
 
             // We'll write content.xml after processing all images
-            logger.log("  Stored content.xml for path updates".to_string());
+            debug!("  Stored content.xml for path updates");
         } else if is_image && !skip_image {
             // Read image data
             let mut image_data = Vec::new();
@@ -570,11 +565,11 @@ fn compress_pack(
 
                         stats.add_kept_original_image(original_size);
 
-                        logger.log(format!(
+                        info!(
                             "  Keeping original (compressed would be larger): {} bytes vs {} bytes",
                             original_size,
                             compressed_size
-                        ));
+                        );
 
                         // Do NOT track this conversion - content.xml will keep original path
                     } else {
@@ -597,24 +592,24 @@ fn compress_pack(
                         stats.add_processed_image(original_size, compressed_size);
 
                         if compressed_size >= original_size {
-                            logger.log(format!(
+                            debug!(
                                 "  Converted to WebP (forced): {} bytes -> {} bytes ({:.1}% increase)",
                                 original_size,
                                 compressed_size,
                                 (compressed_size as f64 / original_size as f64 - 1.0) * 100.0
-                            ));
+                            );
                         } else {
-                            logger.log(format!(
+                            debug!(
                                 "  Converted to WebP: {} bytes -> {} bytes ({:.1}% reduction)",
                                 original_size,
                                 compressed_size,
                                 (1.0 - compressed_size as f64 / original_size as f64) * 100.0
-                            ));
+                            );
                         }
                     }
                 }
                 Err(e) => {
-                    logger.log(format!("  Skipping {}: {}", file_name, e));
+                    debug!("  Skipping {}: {}", file_name, e);
                     
                     // Copy original file unchanged (keep original extension)
                     zip_writer
@@ -639,10 +634,10 @@ fn compress_pack(
 
             // Input size will be tracked by stats methods
 
-            logger.log(format!(
+            debug!(
                 "  Skipping image compression (skip_image flag): {}",
                 file_name
-            ));
+            );
 
             // Copy original file unchanged (keep original extension)
             zip_writer
@@ -683,11 +678,11 @@ fn compress_pack(
 
                         stats.add_kept_original_audio(original_size);
 
-                        logger.log(format!(
+                        info!(
                             "  Keeping original (compressed would be larger): {} bytes vs {} bytes",
                             original_size,
                             compressed_size
-                        ));
+                        );
                     } else {
                         // Use compressed version (either smaller or always_compress is set)
                         zip_writer
@@ -702,24 +697,24 @@ fn compress_pack(
                         stats.add_processed_audio(original_size, compressed_size);
 
                         if compressed_size >= original_size {
-                            logger.log(format!(
+                            debug!(
                                 "  MP3 compressed (forced): {} bytes -> {} bytes ({:.1}% increase)",
                                 original_size,
                                 compressed_size,
                                 (compressed_size as f64 / original_size as f64 - 1.0) * 100.0
-                            ));
+                            );
                         } else {
-                            logger.log(format!(
+                            debug!(
                                 "  MP3 compressed: {} bytes -> {} bytes ({:.1}% reduction)",
                                 original_size,
                                 compressed_size,
                                 (1.0 - compressed_size as f64 / original_size as f64) * 100.0
-                            ));
+                            );
                         }
                     }
                 }
                 Err(e) => {
-                    logger.log(format!("  Skipping {}: {}", file_name, e));
+                    debug!("  Skipping {}: {}", file_name, e);
                     
                     // Copy original file unchanged
                     zip_writer
@@ -740,10 +735,10 @@ fn compress_pack(
             file.read_to_end(&mut audio_data)
                 .with_context(|| format!("Failed to read audio data: {}", file_name))?;
 
-            logger.log(format!(
+            debug!(
                 "  Skipping audio compression (skip_audio flag): {}",
                 file_name
-            ));
+            );
 
             // Copy original file unchanged
             zip_writer
@@ -768,10 +763,10 @@ fn compress_pack(
                 } else {
                     "ffmpeg not available"
                 };
-                logger.log(format!(
+                debug!(
                     "  Skipping video compression ({}): {}",
                     reason, file_name
-                ));
+                );
 
                 // Copy original file unchanged
                 zip_writer
@@ -814,11 +809,11 @@ fn compress_pack(
 
                             stats.add_kept_original_video(original_size);
 
-                            logger.log(format!(
+                            info!(
                                 "  Keeping original (compressed would be larger): {} vs {}",
                                 format_size(original_size),
                                 format_size(compressed_size)
-                            ));
+                            );
                         } else {
                             // Use compressed version (either smaller or always_compress is set)
                             zip_writer
@@ -833,28 +828,28 @@ fn compress_pack(
                             stats.add_processed_video(original_size, compressed_size);
 
                             if compressed_size >= original_size {
-                                logger.log(format!(
+                                debug!(
                                     "  HEVC compressed (forced): {} -> {} ({:.1}% increase)",
                                     format_size(original_size),
                                     format_size(compressed_size),
                                     (compressed_size as f64 / original_size as f64 - 1.0) * 100.0
-                                ));
+                                );
                             } else {
-                                logger.log(format!(
+                                debug!(
                                     "  HEVC compressed: {} -> {} ({:.1}% reduction)",
                                     format_size(original_size),
                                     format_size(compressed_size),
                                     (1.0 - compressed_size as f64 / original_size as f64) * 100.0
-                                ));
+                                );
                             }
                         }
                     }
                     Err(e) => {
                         logger.finish_video_progress(); // Cleanup on error
-                        logger.log(format!(
+                        warn!(
                             "  Video compression failed for {}: {}",
                             file_name, e
-                        ));
+                        );
 
                         // Copy original file unchanged
                         zip_writer
@@ -892,7 +887,7 @@ fn compress_pack(
 
     // Process content.xml with updated image paths
     if let Some(mut xml_content) = content_xml_data {
-        logger.log("Updating content.xml with new image paths".to_string());
+        info!("Updating content.xml with new image paths");
 
         let mut updated_refs = 0;
 
@@ -972,15 +967,15 @@ fn compress_pack(
             updated_refs += file_replacements;
 
             if file_replacements > 0 {
-                logger.log(format!(
+                debug!(
                     "  Updated: {} -> {} ({} refs)",
                     original_filename, webp_filename, file_replacements
-                ));
+                );
             } else {
-                logger.log(format!(
+                warn!(
                     "  Warning: No refs found for {}",
                     original_filename
-                ));
+                );
             }
         }
 
@@ -996,12 +991,12 @@ fn compress_pack(
         stats.add_updated_refs(updated_refs as u32);
         // Note: content.xml size was already tracked when we read it
 
-        logger.log(format!(
+        warn!(
             "Updated {} image references in content.xml",
             updated_refs
-        ));
+        );
     } else {
-        logger.log("Warning: No content.xml found in pack".to_string());
+        warn!("Warning: No content.xml found in pack");
     }
 
     zip_writer

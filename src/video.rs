@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use ffmpeg_sidecar::command::FfmpegCommand;
 use ffmpeg_sidecar::event::{FfmpegEvent, LogLevel};
+use log::{debug, warn};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -257,9 +258,9 @@ pub fn compress_video_file(
     
     // Log video metadata for debugging
     if let Some(frames) = metadata.total_frames {
-        logger.log(format!("Video metadata: {} frames", frames));
+        debug!("Video metadata: {} frames", frames);
     } else {
-        logger.log("Video metadata: frame count unavailable, using fallback progress".to_string());
+        debug!("Video metadata: frame count unavailable, using fallback progress");
     }
 
     let output_temp =
@@ -276,7 +277,7 @@ pub fn compress_video_file(
     let _input_format = get_ffmpeg_format(format); // For future use if explicit format needed
     
     // Log video processing
-    logger.log(format!("Processing video: {}", filename));
+    debug!("Processing video: {}", filename);
     
     ffmpeg_cmd
         .input(input_path.to_string_lossy())  // Input file with auto-detection
@@ -308,7 +309,7 @@ pub fn compress_video_file(
                 // Filter for warnings and errors only
                 match log_level {
                     LogLevel::Warning | LogLevel::Error | LogLevel::Fatal => {
-                        logger.log(format!("FFmpeg: {}", message.trim()));
+                        debug!("FFmpeg: {}", message.trim());
                     },
                     _ => {} // Ignore Info and Unknown levels
                 }
@@ -318,7 +319,7 @@ pub fn compress_video_file(
                 if error_msg.trim() != "No streams found" {
                     has_error = true;
                     error_message = error_msg.clone();
-                    logger.log(format!("FFmpeg Error: {}", error_msg.trim()));
+                    warn!("FFmpeg Error: {}", error_msg.trim());
                 }
             },
             FfmpegEvent::Progress(progress) => {
