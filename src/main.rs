@@ -1051,12 +1051,13 @@ fn compress_pack(
     info!("Compression complete!");
 
     // Images statistics
-    println!("\nImages:");
-    println!("  Processed: {}", stats.images_processed);
-    println!("  Kept original (due to size): {}", stats.images_kept_original);
-    println!("  Skipped: {}", stats.images_skipped);
+    info!("");
+    info!("Images:");
+    info!("  Processed: {}", stats.images_processed);
+    info!("  Kept original (due to size): {}", stats.images_kept_original);
+    info!("  Skipped: {}", stats.images_skipped);
     if stats.image_original_size > 0 {
-        println!(
+        info!(
             "  Size reduction: {} -> {} ({:.1}% reduction)",
             format_size(stats.image_original_size),
             format_size(stats.image_compressed_size),
@@ -1065,20 +1066,21 @@ fn compress_pack(
     }
 
     // Audio statistics
-    println!("\nAudio:");
-    println!("  Processed: {}", stats.audio_processed);
-    println!("  Kept original (due to size): {}", stats.audio_kept_original);
-    println!("  Skipped: {}", stats.audio_skipped);
+    info!("");
+    info!("Audio:");
+    info!("  Processed: {}", stats.audio_processed);
+    info!("  Kept original (due to size): {}", stats.audio_kept_original);
+    info!("  Skipped: {}", stats.audio_skipped);
     if stats.audio_original_size > 0 {
         if stats.audio_compressed_size > 0 {
-            println!(
+            info!(
                 "  Size reduction: {} -> {} ({:.1}% reduction)",
                 format_size(stats.audio_original_size),
                 format_size(stats.audio_compressed_size),
                 stats.audio_compression_ratio()
             );
         } else {
-            println!(
+            info!(
                 "  Total size: {} (no compression applied)",
                 format_size(stats.audio_original_size)
             );
@@ -1086,20 +1088,21 @@ fn compress_pack(
     }
 
     // Video statistics
-    println!("\nVideo:");
-    println!("  Processed: {}", stats.video_processed);
-    println!("  Kept original (due to size): {}", stats.video_kept_original);
-    println!("  Skipped: {}", stats.video_skipped);
+    info!("");
+    info!("Video:");
+    info!("  Processed: {}", stats.video_processed);
+    info!("  Kept original (due to size): {}", stats.video_kept_original);
+    info!("  Skipped: {}", stats.video_skipped);
     if stats.video_original_size > 0 {
         if stats.video_compressed_size > 0 {
-            println!(
+            info!(
                 "  Size reduction: {} -> {} ({:.1}% reduction)",
                 format_size(stats.video_original_size),
                 format_size(stats.video_compressed_size),
                 stats.video_compression_ratio()
             );
         } else {
-            println!(
+            info!(
                 "  Total size: {} (no compression applied)",
                 format_size(stats.video_original_size)
             );
@@ -1108,13 +1111,14 @@ fn compress_pack(
 
     // Overall statistics
     if stats.total_input_size > 0 {
-        println!("\nOverall:");
-        println!("  Total original size: {}", format_size(stats.total_input_size));
-        println!(
+        info!("");
+        info!("Overall:");
+        info!("  Total original size: {}", format_size(stats.total_input_size));
+        info!(
             "  Total compressed size: {}",
             format_size(stats.total_output_size)
         );
-        println!(
+        info!(
             "  Total reduction: {:.1}%",
             stats.total_compression_ratio()
         );
@@ -1122,14 +1126,14 @@ fn compress_pack(
         // Show actual filesystem sizes for verification
         if let Ok(input_metadata) = std::fs::metadata(&input_pack) {
             let input_file_size = input_metadata.len();
-            println!(
+            info!(
                 "  Input file size: {} (filesystem)",
                 format_size(input_file_size)
             );
         }
         if let Ok(output_metadata) = std::fs::metadata(&output_path) {
             let output_file_size = output_metadata.len();
-            println!(
+            info!(
                 "  Output file size: {} (filesystem)",
                 format_size(output_file_size)
             );
