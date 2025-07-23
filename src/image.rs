@@ -3,9 +3,9 @@ use std::path::Path;
 
 pub fn is_supported_image(filename: &str) -> bool {
     let path = Path::new(filename);
-    path.extension().and_then(|s| s.to_str()).is_some_and(|ext| {
-        matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png" | "webp")
-    })
+    path.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png" | "webp"))
 }
 
 pub fn compress_image_file(
@@ -48,16 +48,22 @@ pub fn compress_image_file(
 /// Convert image filename to WebP extension
 pub fn to_webp_filename(filename: &str) -> String {
     let path = Path::new(filename);
-    path.file_stem().and_then(|s| s.to_str()).map_or_else(|| filename.to_string(), |stem| {
-        path.parent().map_or_else(|| format!("{stem}.webp"), |parent| {
-            if parent == Path::new("") {
-                // Handle case where there's no directory
-                format!("{stem}.webp")
-            } else {
-                format!("{}/{}.webp", parent.display(), stem)
-            }
-        })
-    })
+    path.file_stem().and_then(|s| s.to_str()).map_or_else(
+        || filename.to_string(),
+        |stem| {
+            path.parent().map_or_else(
+                || format!("{stem}.webp"),
+                |parent| {
+                    if parent == Path::new("") {
+                        // Handle case where there's no directory
+                        format!("{stem}.webp")
+                    } else {
+                        format!("{}/{}.webp", parent.display(), stem)
+                    }
+                },
+            )
+        },
+    )
 }
 
 #[cfg(test)]

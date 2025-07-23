@@ -417,6 +417,7 @@ fn main() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compress_pack(
     input_pack: PathBuf,
     output_pack: Option<PathBuf>,
@@ -1159,6 +1160,7 @@ mod tests {
             false,
             None,
             false,
+            MultiProgress::new(),
         );
         assert!(result.is_err());
 
@@ -1168,7 +1170,17 @@ mod tests {
         let temp_path = temp_file.path().to_path_buf();
 
         let result = compress_pack(
-            temp_path, None, 85, 85, 75, false, false, false, None, false,
+            temp_path,
+            None,
+            85,
+            85,
+            75,
+            false,
+            false,
+            false,
+            None,
+            false,
+            MultiProgress::new(),
         );
         assert!(result.is_err());
     }
@@ -1189,6 +1201,7 @@ mod tests {
             false,
             None,
             false,
+            MultiProgress::new(),
         );
         assert!(result.is_err());
 
@@ -1203,6 +1216,7 @@ mod tests {
             false,
             None,
             false,
+            MultiProgress::new(),
         );
         assert!(result.is_err());
 
@@ -1217,6 +1231,7 @@ mod tests {
             false,
             None,
             false,
+            MultiProgress::new(),
         );
         assert!(result.is_err());
 
@@ -1231,6 +1246,7 @@ mod tests {
             false,
             None,
             false,
+            MultiProgress::new(),
         );
         assert!(result.is_err());
 
@@ -1245,6 +1261,7 @@ mod tests {
             false,
             None,
             false,
+            MultiProgress::new(),
         );
         assert!(result.is_err());
 
@@ -1259,11 +1276,24 @@ mod tests {
             false,
             None,
             false,
+            MultiProgress::new(),
         );
         assert!(result.is_err());
 
         // Valid quality should work (though will fail due to invalid ZIP content)
-        let result = compress_pack(temp_siq, None, 50, 75, 60, false, false, false, None, false);
+        let result = compress_pack(
+            temp_siq,
+            None,
+            50,
+            75,
+            60,
+            false,
+            false,
+            false,
+            None,
+            false,
+            MultiProgress::new(),
+        );
         // This will fail at ZIP reading stage, but quality validation should pass
         assert!(result.is_err());
         assert!(

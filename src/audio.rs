@@ -26,9 +26,9 @@ pub enum AudioFormat {
 /// Check if an audio file format is supported
 pub fn is_supported_audio(filename: &str) -> bool {
     let path = Path::new(filename);
-    path.extension().and_then(|s| s.to_str()).is_some_and(|ext| {
-        matches!(ext.to_lowercase().as_str(), "mp3")
-    })
+    path.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| matches!(ext.to_lowercase().as_str(), "mp3"))
 }
 
 /// Detect audio format from file extension
@@ -83,7 +83,8 @@ fn decode_audio_data(data: &[u8]) -> Result<(Vec<f32>, u32, u32)> {
     // Create a media source from the byte data (copy to owned Vec to fix lifetime)
     let data_owned = data.to_vec();
     let cursor = std::io::Cursor::new(data_owned);
-    let media_source = MediaSourceStream::new(Box::new(cursor), MediaSourceStreamOptions::default());
+    let media_source =
+        MediaSourceStream::new(Box::new(cursor), MediaSourceStreamOptions::default());
 
     // Create a probe hint (we'll let Symphonia auto-detect the format)
     let hint = Hint::new();
