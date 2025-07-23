@@ -87,10 +87,10 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Install Rust 1.76 (MSRV)
+    - name: Install Rust 1.85 (MSRV)
       uses: dtolnay/rust-toolchain@master
       with:
-        toolchain: "1.76"
+        toolchain: "1.85"
 
     - name: Cache Cargo dependencies
       uses: actions/cache@v4
@@ -101,7 +101,7 @@ jobs:
           ~/.cargo/registry/cache/
           ~/.cargo/git/db/
           target/
-        key: ubuntu-msrv-cargo-${{ hashFiles('**/Cargo.lock') }}
+        key: ubuntu-msrv-1.85-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Install FFmpeg
       run: |
