@@ -15,7 +15,7 @@ zip = "0.6"
 image = { version = "0.25", features = ["jpeg", "png", "webp"] }
 webp = "0.3"
 indicatif = "0.18"
-mp3lame-encoder = "0.1"
+mp3lame-encoder = "0.2"
 symphonia = { version = "0.5", features = ["all"] }
 urlencoding = "2.1"
 ffmpeg-sidecar = "2.0"
