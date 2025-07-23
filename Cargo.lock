@@ -1709,7 +1709,7 @@ dependencies = [
  "mp3lame-encoder",
  "symphonia",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.12",
  "urlencoding",
  "webp",
  "zip 0.6.6",
