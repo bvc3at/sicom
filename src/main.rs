@@ -663,9 +663,7 @@ fn compress_pack(
 
             // Input size will be tracked by stats methods
 
-            debug!(
-                "  Skipping image compression (skip_image flag): {file_name}"
-            );
+            debug!("  Skipping image compression (skip_image flag): {file_name}");
 
             // Copy original file unchanged (keep original extension)
             zip_writer
@@ -761,9 +759,7 @@ fn compress_pack(
             file.read_to_end(&mut audio_data)
                 .with_context(|| format!("Failed to read audio data: {file_name}"))?;
 
-            debug!(
-                "  Skipping audio compression (skip_audio flag): {file_name}"
-            );
+            debug!("  Skipping audio compression (skip_audio flag): {file_name}");
 
             // Copy original file unchanged
             zip_writer
@@ -791,12 +787,10 @@ fn compress_pack(
                 // Copy original file unchanged
                 zip_writer
                     .start_file(&file_name, zip::write::FileOptions::default())
-                    .with_context(|| {
-                        format!("Failed to start file in output ZIP: {file_name}")
-                    })?;
-                zip_writer.write_all(&video_data).with_context(|| {
-                    format!("Failed to write original video file: {file_name}")
-                })?;
+                    .with_context(|| format!("Failed to start file in output ZIP: {file_name}"))?;
+                zip_writer
+                    .write_all(&video_data)
+                    .with_context(|| format!("Failed to write original video file: {file_name}"))?;
 
                 stats.add_skipped_video(video_data.len() as u64);
             } else {
@@ -961,10 +955,7 @@ fn compress_pack(
                             format!("isRef='True'>{webp_var}"),
                         ),
                         // Full path references
-                        (
-                            format!("Images/{orig_var}"),
-                            format!("Images/{webp_var}"),
-                        ),
+                        (format!("Images/{orig_var}"), format!("Images/{webp_var}")),
                         // Path references with isRef
                         (
                             format!("isRef=\"True\">Images/{orig_var}"),
