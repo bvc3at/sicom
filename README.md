@@ -40,7 +40,7 @@
 ## 🚀 Installation
 
 ### Prerequisites
-- **Rust** (1.70 or later) - Install from [rustup.rs](https://rustup.rs/)
+- **Rust** (1.85 or later) - Install from [rustup.rs](https://rustup.rs/)
 - **FFmpeg** (for video compression) - Required for video processing
 
 #### Install FFmpeg:
