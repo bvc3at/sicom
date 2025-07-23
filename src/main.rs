@@ -465,10 +465,10 @@ fn compress_pack(
     // Detect or validate ffmpeg path
     let ffmpeg_available = if let Some(path) = &ffmpeg_path {
         if path.exists() {
-            info!("Using ffmpeg at: {:?}", path);
+            info!("Using ffmpeg at: {path:?}");
             true
         } else {
-            warn!("Specified ffmpeg path does not exist: {:?}", path);
+            warn!("Specified ffmpeg path does not exist: {path:?}");
             false
         }
     } else {
@@ -476,7 +476,7 @@ fn compress_pack(
         match std::process::Command::new("which").arg("ffmpeg").output() {
             Ok(output) if output.status.success() => {
                 let ffmpeg_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                info!("Auto-detected ffmpeg at: {}", ffmpeg_path);
+                info!("Auto-detected ffmpeg at: {ffmpeg_path}");
                 true
             }
             _ => {
@@ -507,13 +507,13 @@ fn compress_pack(
 
     // Open input ZIP
     let input_file = File::open(&input_pack)
-        .with_context(|| format!("Failed to open input file: {:?}", input_pack))?;
+        .with_context(|| format!("Failed to open input file: {input_pack:?}"))?;
     let mut archive = ZipArchive::new(BufReader::new(input_file))
         .with_context(|| "Failed to read ZIP archive")?;
 
     // Create output ZIP
     let output_file = File::create(&output_path)
-        .with_context(|| format!("Failed to create output file: {:?}", output_path))?;
+        .with_context(|| format!("Failed to create output file: {output_path:?}"))?;
     let mut zip_writer = ZipWriter::new(BufWriter::new(output_file));
 
     // Statistics tracking
@@ -548,7 +548,7 @@ fn compress_pack(
     for i in 0..archive.len() {
         let mut file = archive
             .by_index(i)
-            .with_context(|| format!("Failed to read file at index {}", i))?;
+            .with_context(|| format!("Failed to read file at index {i}"))?;
 
         let file_name = file.name().to_string();
         let is_image = file_name.starts_with("Images/") && image::is_supported_image(&file_name);
@@ -556,7 +556,7 @@ fn compress_pack(
         let is_video = file_name.starts_with("Video/") && video::is_supported_video(&file_name);
         let is_content_xml = file_name == "content.xml";
 
-        debug!("Processing: {}", file_name);
+        debug!("Processing: {file_name}");
 
         if is_content_xml {
             // Read content.xml for later processing
@@ -575,7 +575,7 @@ fn compress_pack(
             // Read image data
             let mut image_data = Vec::new();
             file.read_to_end(&mut image_data)
-                .with_context(|| format!("Failed to read image data: {}", file_name))?;
+                .with_context(|| format!("Failed to read image data: {file_name}"))?;
 
             match image::compress_image_file(&image_data, &file_name, image_quality) {
                 Ok((compressed_data, original_size, compressed_size)) => {
@@ -585,17 +585,16 @@ fn compress_pack(
                         zip_writer
                             .start_file(&file_name, zip::write::FileOptions::default())
                             .with_context(|| {
-                                format!("Failed to start file in output ZIP: {}", file_name)
+                                format!("Failed to start file in output ZIP: {file_name}")
                             })?;
                         zip_writer.write_all(&image_data).with_context(|| {
-                            format!("Failed to write original image: {}", file_name)
+                            format!("Failed to write original image: {file_name}")
                         })?;
 
                         stats.add_kept_original_image(original_size);
 
                         info!(
-                            "  Keeping original (compressed would be larger): {} bytes vs {} bytes",
-                            original_size, compressed_size
+                            "  Keeping original (compressed would be larger): {original_size} bytes vs {compressed_size} bytes"
                         );
 
                         // Do NOT track this conversion - content.xml will keep original path
@@ -607,10 +606,10 @@ fn compress_pack(
                         zip_writer
                             .start_file(&webp_filename, zip::write::FileOptions::default())
                             .with_context(|| {
-                                format!("Failed to start file in output ZIP: {}", webp_filename)
+                                format!("Failed to start file in output ZIP: {webp_filename}")
                             })?;
                         zip_writer.write_all(&compressed_data).with_context(|| {
-                            format!("Failed to write compressed image: {}", webp_filename)
+                            format!("Failed to write compressed image: {webp_filename}")
                         })?;
 
                         // Track the conversion for content.xml updates
@@ -639,17 +638,17 @@ fn compress_pack(
                     }
                 }
                 Err(e) => {
-                    debug!("  Skipping {}: {}", file_name, e);
+                    debug!("  Skipping {file_name}: {e}");
 
                     // Copy original file unchanged (keep original extension)
                     zip_writer
                         .start_file(&file_name, zip::write::FileOptions::default())
                         .with_context(|| {
-                            format!("Failed to start file in output ZIP: {}", file_name)
+                            format!("Failed to start file in output ZIP: {file_name}")
                         })?;
                     zip_writer
                         .write_all(&image_data)
-                        .with_context(|| format!("Failed to write original file: {}", file_name))?;
+                        .with_context(|| format!("Failed to write original file: {file_name}"))?;
 
                     stats.add_skipped_image(image_data.len() as u64);
 
@@ -660,22 +659,21 @@ fn compress_pack(
             // Skip image compression - copy original file unchanged
             let mut image_data = Vec::new();
             file.read_to_end(&mut image_data)
-                .with_context(|| format!("Failed to read image data: {}", file_name))?;
+                .with_context(|| format!("Failed to read image data: {file_name}"))?;
 
             // Input size will be tracked by stats methods
 
             debug!(
-                "  Skipping image compression (skip_image flag): {}",
-                file_name
+                "  Skipping image compression (skip_image flag): {file_name}"
             );
 
             // Copy original file unchanged (keep original extension)
             zip_writer
                 .start_file(&file_name, zip::write::FileOptions::default())
-                .with_context(|| format!("Failed to start file in output ZIP: {}", file_name))?;
+                .with_context(|| format!("Failed to start file in output ZIP: {file_name}"))?;
             zip_writer
                 .write_all(&image_data)
-                .with_context(|| format!("Failed to write original image: {}", file_name))?;
+                .with_context(|| format!("Failed to write original image: {file_name}"))?;
 
             stats.add_skipped_image(image_data.len() as u64);
 
@@ -684,7 +682,7 @@ fn compress_pack(
             // Read audio data
             let mut audio_data = Vec::new();
             file.read_to_end(&mut audio_data)
-                .with_context(|| format!("Failed to read audio data: {}", file_name))?;
+                .with_context(|| format!("Failed to read audio data: {file_name}"))?;
 
             // Track input size
 
@@ -697,27 +695,26 @@ fn compress_pack(
                         zip_writer
                             .start_file(&file_name, zip::write::FileOptions::default())
                             .with_context(|| {
-                                format!("Failed to start file in output ZIP: {}", file_name)
+                                format!("Failed to start file in output ZIP: {file_name}")
                             })?;
                         zip_writer.write_all(&audio_data).with_context(|| {
-                            format!("Failed to write original audio: {}", file_name)
+                            format!("Failed to write original audio: {file_name}")
                         })?;
 
                         stats.add_kept_original_audio(original_size);
 
                         info!(
-                            "  Keeping original (compressed would be larger): {} bytes vs {} bytes",
-                            original_size, compressed_size
+                            "  Keeping original (compressed would be larger): {original_size} bytes vs {compressed_size} bytes"
                         );
                     } else {
                         // Use compressed version (either smaller or always_compress is set)
                         zip_writer
                             .start_file(&file_name, zip::write::FileOptions::default())
                             .with_context(|| {
-                                format!("Failed to start file in output ZIP: {}", file_name)
+                                format!("Failed to start file in output ZIP: {file_name}")
                             })?;
                         zip_writer.write_all(&compressed_data).with_context(|| {
-                            format!("Failed to write compressed audio: {}", file_name)
+                            format!("Failed to write compressed audio: {file_name}")
                         })?;
 
                         stats.add_processed_audio(original_size, compressed_size);
@@ -743,16 +740,16 @@ fn compress_pack(
                     }
                 }
                 Err(e) => {
-                    debug!("  Skipping {}: {}", file_name, e);
+                    debug!("  Skipping {file_name}: {e}");
 
                     // Copy original file unchanged
                     zip_writer
                         .start_file(&file_name, zip::write::FileOptions::default())
                         .with_context(|| {
-                            format!("Failed to start file in output ZIP: {}", file_name)
+                            format!("Failed to start file in output ZIP: {file_name}")
                         })?;
                     zip_writer.write_all(&audio_data).with_context(|| {
-                        format!("Failed to write original audio file: {}", file_name)
+                        format!("Failed to write original audio file: {file_name}")
                     })?;
 
                     stats.add_skipped_audio(audio_data.len() as u64);
@@ -762,27 +759,26 @@ fn compress_pack(
             // Skip audio compression - copy original file unchanged
             let mut audio_data = Vec::new();
             file.read_to_end(&mut audio_data)
-                .with_context(|| format!("Failed to read audio data: {}", file_name))?;
+                .with_context(|| format!("Failed to read audio data: {file_name}"))?;
 
             debug!(
-                "  Skipping audio compression (skip_audio flag): {}",
-                file_name
+                "  Skipping audio compression (skip_audio flag): {file_name}"
             );
 
             // Copy original file unchanged
             zip_writer
                 .start_file(&file_name, zip::write::FileOptions::default())
-                .with_context(|| format!("Failed to start file in output ZIP: {}", file_name))?;
+                .with_context(|| format!("Failed to start file in output ZIP: {file_name}"))?;
             zip_writer
                 .write_all(&audio_data)
-                .with_context(|| format!("Failed to write original audio file: {}", file_name))?;
+                .with_context(|| format!("Failed to write original audio file: {file_name}"))?;
 
             stats.add_skipped_audio(audio_data.len() as u64);
         } else if is_video {
             // Read video data
             let mut video_data = Vec::new();
             file.read_to_end(&mut video_data)
-                .with_context(|| format!("Failed to read video data: {}", file_name))?;
+                .with_context(|| format!("Failed to read video data: {file_name}"))?;
 
             if skip_video || !ffmpeg_available {
                 let reason = if skip_video {
@@ -790,16 +786,16 @@ fn compress_pack(
                 } else {
                     "ffmpeg not available"
                 };
-                debug!("  Skipping video compression ({}): {}", reason, file_name);
+                debug!("  Skipping video compression ({reason}): {file_name}");
 
                 // Copy original file unchanged
                 zip_writer
                     .start_file(&file_name, zip::write::FileOptions::default())
                     .with_context(|| {
-                        format!("Failed to start file in output ZIP: {}", file_name)
+                        format!("Failed to start file in output ZIP: {file_name}")
                     })?;
                 zip_writer.write_all(&video_data).with_context(|| {
-                    format!("Failed to write original video file: {}", file_name)
+                    format!("Failed to write original video file: {file_name}")
                 })?;
 
                 stats.add_skipped_video(video_data.len() as u64);
@@ -825,10 +821,10 @@ fn compress_pack(
                             zip_writer
                                 .start_file(&file_name, zip::write::FileOptions::default())
                                 .with_context(|| {
-                                    format!("Failed to start file in output ZIP: {}", file_name)
+                                    format!("Failed to start file in output ZIP: {file_name}")
                                 })?;
                             zip_writer.write_all(&video_data).with_context(|| {
-                                format!("Failed to write original video: {}", file_name)
+                                format!("Failed to write original video: {file_name}")
                             })?;
 
                             stats.add_kept_original_video(original_size);
@@ -843,10 +839,10 @@ fn compress_pack(
                             zip_writer
                                 .start_file(&file_name, zip::write::FileOptions::default())
                                 .with_context(|| {
-                                    format!("Failed to start file in output ZIP: {}", file_name)
+                                    format!("Failed to start file in output ZIP: {file_name}")
                                 })?;
                             zip_writer.write_all(&compressed_data).with_context(|| {
-                                format!("Failed to write compressed video: {}", file_name)
+                                format!("Failed to write compressed video: {file_name}")
                             })?;
 
                             stats.add_processed_video(original_size, compressed_size);
@@ -873,16 +869,16 @@ fn compress_pack(
                     }
                     Err(e) => {
                         logger.finish_video_progress(); // Cleanup on error
-                        warn!("  Video compression failed for {}: {}", file_name, e);
+                        warn!("  Video compression failed for {file_name}: {e}");
 
                         // Copy original file unchanged
                         zip_writer
                             .start_file(&file_name, zip::write::FileOptions::default())
                             .with_context(|| {
-                                format!("Failed to start file in output ZIP: {}", file_name)
+                                format!("Failed to start file in output ZIP: {file_name}")
                             })?;
                         zip_writer.write_all(&video_data).with_context(|| {
-                            format!("Failed to write original video file: {}", file_name)
+                            format!("Failed to write original video file: {file_name}")
                         })?;
 
                         stats.add_skipped_video(video_data.len() as u64);
@@ -893,14 +889,14 @@ fn compress_pack(
             // Copy other files unchanged
             let mut buffer = Vec::new();
             file.read_to_end(&mut buffer)
-                .with_context(|| format!("Failed to read file: {}", file_name))?;
+                .with_context(|| format!("Failed to read file: {file_name}"))?;
 
             zip_writer
                 .start_file(&file_name, zip::write::FileOptions::default())
-                .with_context(|| format!("Failed to start file in output ZIP: {}", file_name))?;
+                .with_context(|| format!("Failed to start file in output ZIP: {file_name}"))?;
             zip_writer
                 .write_all(&buffer)
-                .with_context(|| format!("Failed to write file: {}", file_name))?;
+                .with_context(|| format!("Failed to write file: {file_name}"))?;
 
             stats.add_other_file(buffer.len() as u64);
         }
@@ -951,28 +947,28 @@ fn compress_pack(
                         (orig_var.clone(), webp_var.clone()),
                         // With isRef="True" wrapper
                         (
-                            format!("isRef=\"True\">{}", orig_var),
-                            format!("isRef=\"True\">{}", webp_var),
+                            format!("isRef=\"True\">{orig_var}"),
+                            format!("isRef=\"True\">{webp_var}"),
                         ),
                         // With type="image" attribute
                         (
-                            format!("type=\"image\" isRef=\"True\">{}", orig_var),
-                            format!("type=\"image\" isRef=\"True\">{}", webp_var),
+                            format!("type=\"image\" isRef=\"True\">{orig_var}"),
+                            format!("type=\"image\" isRef=\"True\">{webp_var}"),
                         ),
                         // With different quote styles
                         (
-                            format!("isRef='True'>{}", orig_var),
-                            format!("isRef='True'>{}", webp_var),
+                            format!("isRef='True'>{orig_var}"),
+                            format!("isRef='True'>{webp_var}"),
                         ),
                         // Full path references
                         (
-                            format!("Images/{}", orig_var),
-                            format!("Images/{}", webp_var),
+                            format!("Images/{orig_var}"),
+                            format!("Images/{webp_var}"),
                         ),
                         // Path references with isRef
                         (
-                            format!("isRef=\"True\">Images/{}", orig_var),
-                            format!("isRef=\"True\">Images/{}", webp_var),
+                            format!("isRef=\"True\">Images/{orig_var}"),
+                            format!("isRef=\"True\">Images/{webp_var}"),
                         ),
                     ];
 
@@ -992,11 +988,10 @@ fn compress_pack(
 
             if file_replacements > 0 {
                 debug!(
-                    "  Updated: {} -> {} ({} refs)",
-                    original_filename, webp_filename, file_replacements
+                    "  Updated: {original_filename} -> {webp_filename} ({file_replacements} refs)"
                 );
             } else {
-                warn!("  Warning: No refs found for {}", original_filename);
+                warn!("  Warning: No refs found for {original_filename}");
             }
         }
 
@@ -1012,7 +1007,7 @@ fn compress_pack(
         stats.add_updated_refs(updated_refs as u32);
         // Note: content.xml size was already tracked when we read it
 
-        warn!("Updated {} image references in content.xml", updated_refs);
+        warn!("Updated {updated_refs} image references in content.xml");
     } else {
         warn!("Warning: No content.xml found in pack");
     }
@@ -1142,7 +1137,7 @@ mod tests {
         // This tests the logic in compress_pack function
         let mut path = input.clone();
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap();
-        path.set_file_name(format!("{}_compressed.siq", stem));
+        path.set_file_name(format!("{stem}_compressed.siq"));
 
         assert_eq!(path, expected);
     }

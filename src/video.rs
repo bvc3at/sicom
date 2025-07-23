@@ -280,7 +280,7 @@ pub fn compress_video_file(
 
     // Log video metadata for debugging
     if let Some(frames) = metadata.total_frames {
-        debug!("Video metadata: {} frames", frames);
+        debug!("Video metadata: {frames} frames");
     } else {
         debug!("Video metadata: frame count unavailable, using fallback progress");
     }
@@ -301,7 +301,7 @@ pub fn compress_video_file(
     let _input_format = get_ffmpeg_format(format); // For future use if explicit format needed
 
     // Log video processing
-    debug!("Processing video: {}", filename);
+    debug!("Processing video: {filename}");
 
     ffmpeg_cmd
         .input(input_path.to_string_lossy()) // Input file with auto-detection
