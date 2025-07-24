@@ -349,7 +349,7 @@ pub fn compress_video_file(
             }
             FfmpegEvent::Progress(progress) => {
                 // Update video progress bar using hybrid frame/time-based calculation
-                if let Some(video_bar) = &logger.video_progress_bar {
+                if let Some(video_bar) = logger.video_progress_bar() {
                     match calculate_video_progress(progress.frame, &progress.time, &metadata) {
                         Some(progress_percent) => {
                             // Accurate progress available - set position

@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::MultiProgress;
 use indicatif_log_bridge::LogWrapper;
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
@@ -14,161 +14,12 @@ use zip::{ZipArchive, ZipWriter};
 
 mod audio;
 mod image;
+mod progress;
+mod stats;
 mod video;
 
-/// Statistics tracking for compression operations
-#[derive(Debug, Default)]
-struct CompressionStats {
-    // Image statistics
-    images_processed: u32,
-    images_skipped: u32,
-    images_kept_original: u32,
-    image_original_size: u64,
-    image_compressed_size: u64,
-
-    // Audio statistics
-    audio_processed: u32,
-    audio_skipped: u32,
-    audio_kept_original: u32,
-    audio_original_size: u64,
-    audio_compressed_size: u64,
-
-    // Video statistics
-    video_processed: u32,
-    video_skipped: u32,
-    video_kept_original: u32,
-    video_original_size: u64,
-    video_compressed_size: u64,
-
-    // Overall statistics
-    total_input_size: u64,
-    total_output_size: u64,
-    total_updated_refs: u32,
-}
-
-impl CompressionStats {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    // Image tracking methods
-    fn add_processed_image(&mut self, original_size: u64, compressed_size: u64) {
-        self.images_processed += 1;
-        self.image_original_size += original_size;
-        self.image_compressed_size += compressed_size;
-        self.total_input_size += original_size;
-        self.total_output_size += compressed_size;
-    }
-
-    fn add_kept_original_image(&mut self, size: u64) {
-        self.images_kept_original += 1;
-        self.image_original_size += size;
-        self.image_compressed_size += size;
-        self.total_input_size += size;
-        self.total_output_size += size;
-    }
-
-    fn add_skipped_image(&mut self, size: u64) {
-        self.images_skipped += 1;
-        self.image_original_size += size;
-        self.image_compressed_size += size;
-        self.total_input_size += size;
-        self.total_output_size += size;
-    }
-
-    // Audio tracking methods
-    fn add_processed_audio(&mut self, original_size: u64, compressed_size: u64) {
-        self.audio_processed += 1;
-        self.audio_original_size += original_size;
-        self.audio_compressed_size += compressed_size;
-        self.total_input_size += original_size;
-        self.total_output_size += compressed_size;
-    }
-
-    fn add_kept_original_audio(&mut self, size: u64) {
-        self.audio_kept_original += 1;
-        self.audio_original_size += size;
-        self.audio_compressed_size += size;
-        self.total_input_size += size;
-        self.total_output_size += size;
-    }
-
-    fn add_skipped_audio(&mut self, size: u64) {
-        self.audio_skipped += 1;
-        self.audio_original_size += size;
-        self.audio_compressed_size += size;
-        self.total_input_size += size;
-        self.total_output_size += size;
-    }
-
-    // Video tracking methods
-    fn add_processed_video(&mut self, original_size: u64, compressed_size: u64) {
-        self.video_processed += 1;
-        self.video_original_size += original_size;
-        self.video_compressed_size += compressed_size;
-        self.total_input_size += original_size;
-        self.total_output_size += compressed_size;
-    }
-
-    fn add_kept_original_video(&mut self, size: u64) {
-        self.video_kept_original += 1;
-        self.video_original_size += size;
-        self.video_compressed_size += size;
-        self.total_input_size += size;
-        self.total_output_size += size;
-    }
-
-    fn add_skipped_video(&mut self, size: u64) {
-        self.video_skipped += 1;
-        self.video_original_size += size;
-        self.video_compressed_size += size;
-        self.total_input_size += size;
-        self.total_output_size += size;
-    }
-
-    // Other file tracking
-    fn add_other_file(&mut self, size: u64) {
-        self.total_input_size += size;
-        self.total_output_size += size;
-    }
-
-    fn add_updated_refs(&mut self, count: u32) {
-        self.total_updated_refs += count;
-    }
-
-    // Calculation methods
-    fn total_compression_ratio(&self) -> f64 {
-        if self.total_input_size > 0 {
-            (1.0 - self.total_output_size as f64 / self.total_input_size as f64) * 100.0
-        } else {
-            0.0
-        }
-    }
-
-    fn image_compression_ratio(&self) -> f64 {
-        if self.image_original_size > 0 {
-            (1.0 - self.image_compressed_size as f64 / self.image_original_size as f64) * 100.0
-        } else {
-            0.0
-        }
-    }
-
-    fn audio_compression_ratio(&self) -> f64 {
-        if self.audio_original_size > 0 {
-            (1.0 - self.audio_compressed_size as f64 / self.audio_original_size as f64) * 100.0
-        } else {
-            0.0
-        }
-    }
-
-    fn video_compression_ratio(&self) -> f64 {
-        if self.video_original_size > 0 {
-            (1.0 - self.video_compressed_size as f64 / self.video_original_size as f64) * 100.0
-        } else {
-            0.0
-        }
-    }
-}
+use progress::{ProgressLogger, get_log_color_with_module};
+use stats::CompressionStats;
 
 #[derive(Error, Debug)]
 pub enum SicomError {
@@ -178,59 +29,6 @@ pub enum SicomError {
     InvalidSiqFile(PathBuf),
     #[error("Failed to process image {name}: {source}")]
     ImageProcessingError { name: String, source: anyhow::Error },
-}
-
-struct ProgressLogger {
-    progress_bar: ProgressBar,
-    video_progress_bar: Option<ProgressBar>, // Video encoding progress
-}
-
-impl ProgressLogger {
-    fn new(total_files: u64, multi_progress: &MultiProgress) -> Self {
-        // Create main progress bar
-        let progress_bar = multi_progress.add(ProgressBar::new(total_files));
-        progress_bar.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} files (ETA: {eta})")
-                .unwrap()
-                .progress_chars("#>-"),
-        );
-
-        Self {
-            progress_bar,
-            video_progress_bar: None,
-        }
-    }
-
-    fn inc(&mut self) {
-        self.progress_bar.inc(1);
-    }
-
-    fn start_video_progress(&mut self, filename: &str, multi_progress: &MultiProgress) {
-        let video_bar = multi_progress.add(ProgressBar::new(100));
-        video_bar.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.blue} Encoding {msg}: [{wide_bar:.yellow/blue}] {percent}%")
-                .unwrap()
-                .progress_chars("#>-"),
-        );
-        video_bar.set_message(filename.to_string());
-        self.video_progress_bar = Some(video_bar);
-    }
-
-    fn finish_video_progress(&mut self) {
-        if let Some(bar) = self.video_progress_bar.take() {
-            bar.finish_and_clear();
-        }
-    }
-
-    fn finish(&mut self) {
-        // Finish video progress bar if still active
-        self.finish_video_progress();
-
-        // Finish and clear the main progress bar
-        self.progress_bar.finish_and_clear();
-    }
 }
 
 #[derive(Parser)]
@@ -298,30 +96,6 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{:.1} {}", size, UNITS[unit_index])
     }
-}
-
-/// Get ANSI color code for log level
-const fn get_log_color(level: log::Level) -> &'static str {
-    match level {
-        log::Level::Error => "\x1b[91m",                     // Red
-        log::Level::Warn => "\x1b[33m",                      // Orange-red/Yellow
-        log::Level::Info => "\x1b[32m",                      // Darker green (same as Cargo)
-        log::Level::Debug | log::Level::Trace => "\x1b[90m", // Grey
-    }
-}
-
-/// Get ANSI color code for log level with module-specific overrides
-fn get_log_color_with_module(level: log::Level, module_path: Option<&str>) -> &'static str {
-    // Special handling for Symphonia library messages
-    if let Some(module) = module_path {
-        if module.starts_with("symphonia") && level == log::Level::Info {
-            // Make Symphonia info messages gray to reduce visual noise
-            return "\x1b[90m"; // Grey
-        }
-    }
-
-    // Use default color for all other cases
-    get_log_color(level)
 }
 
 fn main() {
@@ -809,7 +583,6 @@ fn compress_pack(
                 match video_result {
                     Ok((compressed_data, original_size, compressed_size)) => {
                         logger.finish_video_progress();
-                        // FFmpeg logs are now handled in real-time during compression
 
                         // Check if compression actually reduced size
                         if compressed_size >= original_size && !always_compress {
@@ -1017,17 +790,17 @@ fn compress_pack(
     // Images statistics
     info!("");
     info!("Images:");
-    info!("  Processed: {}", stats.images_processed);
+    info!("  Processed: {}", stats.images_processed());
     info!(
         "  Kept original (due to size): {}",
-        stats.images_kept_original
+        stats.images_kept_original()
     );
-    info!("  Skipped: {}", stats.images_skipped);
-    if stats.image_original_size > 0 {
+    info!("  Skipped: {}", stats.images_skipped());
+    if stats.image_original_size() > 0 {
         info!(
             "  Size reduction: {} -> {} ({:.1}% reduction)",
-            format_size(stats.image_original_size),
-            format_size(stats.image_compressed_size),
+            format_size(stats.image_original_size()),
+            format_size(stats.image_compressed_size()),
             stats.image_compression_ratio()
         );
     }
@@ -1035,24 +808,24 @@ fn compress_pack(
     // Audio statistics
     info!("");
     info!("Audio:");
-    info!("  Processed: {}", stats.audio_processed);
+    info!("  Processed: {}", stats.audio_processed());
     info!(
         "  Kept original (due to size): {}",
-        stats.audio_kept_original
+        stats.audio_kept_original()
     );
-    info!("  Skipped: {}", stats.audio_skipped);
-    if stats.audio_original_size > 0 {
-        if stats.audio_compressed_size > 0 {
+    info!("  Skipped: {}", stats.audio_skipped());
+    if stats.audio_original_size() > 0 {
+        if stats.audio_compressed_size() > 0 {
             info!(
                 "  Size reduction: {} -> {} ({:.1}% reduction)",
-                format_size(stats.audio_original_size),
-                format_size(stats.audio_compressed_size),
+                format_size(stats.audio_original_size()),
+                format_size(stats.audio_compressed_size()),
                 stats.audio_compression_ratio()
             );
         } else {
             info!(
                 "  Total size: {} (no compression applied)",
-                format_size(stats.audio_original_size)
+                format_size(stats.audio_original_size())
             );
         }
     }
@@ -1060,39 +833,39 @@ fn compress_pack(
     // Video statistics
     info!("");
     info!("Video:");
-    info!("  Processed: {}", stats.video_processed);
+    info!("  Processed: {}", stats.video_processed());
     info!(
         "  Kept original (due to size): {}",
-        stats.video_kept_original
+        stats.video_kept_original()
     );
-    info!("  Skipped: {}", stats.video_skipped);
-    if stats.video_original_size > 0 {
-        if stats.video_compressed_size > 0 {
+    info!("  Skipped: {}", stats.video_skipped());
+    if stats.video_original_size() > 0 {
+        if stats.video_compressed_size() > 0 {
             info!(
                 "  Size reduction: {} -> {} ({:.1}% reduction)",
-                format_size(stats.video_original_size),
-                format_size(stats.video_compressed_size),
+                format_size(stats.video_original_size()),
+                format_size(stats.video_compressed_size()),
                 stats.video_compression_ratio()
             );
         } else {
             info!(
                 "  Total size: {} (no compression applied)",
-                format_size(stats.video_original_size)
+                format_size(stats.video_original_size())
             );
         }
     }
 
     // Overall statistics
-    if stats.total_input_size > 0 {
+    if stats.total_input_size() > 0 {
         info!("");
         info!("Overall:");
         info!(
             "  Total original size: {}",
-            format_size(stats.total_input_size)
+            format_size(stats.total_input_size())
         );
         info!(
             "  Total compressed size: {}",
-            format_size(stats.total_output_size)
+            format_size(stats.total_output_size())
         );
         info!("  Total reduction: {:.1}%", stats.total_compression_ratio());
 
