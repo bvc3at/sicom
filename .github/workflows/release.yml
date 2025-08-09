@@ -129,8 +129,6 @@ jobs:
         Compress-Archive -Path "target/${{ matrix.target }}/release/sicom.exe" -DestinationPath "sicom-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.zip"
 
     - name: Upload Release Asset
-      run: |
-        gh release upload ${{ needs.create-release.outputs.version }} \
-          ./sicom-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.${{ matrix.archive_ext }}
+      run: gh release upload ${{ needs.create-release.outputs.version }} ./sicom-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.${{ matrix.archive_ext }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
