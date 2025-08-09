@@ -5,6 +5,9 @@ on:
     tags:
       - 'v*.*.*'
 
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -13,7 +16,6 @@ jobs:
     name: Create Release
     runs-on: ubuntu-latest
     outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
       version: ${{ steps.get_version.outputs.version }}
     steps:
     - name: Checkout code
@@ -24,38 +26,33 @@ jobs:
       run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
     - name: Create Release
-      id: create_release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ github.ref }}
-        release_name: sicom ${{ steps.get_version.outputs.version }}
-        body: |
-          ## sicom ${{ steps.get_version.outputs.version }}
+      run: |
+        gh release create ${{ github.ref_name }} \
+          --title "sicom ${{ steps.get_version.outputs.version }}" \
+          --notes "## sicom ${{ steps.get_version.outputs.version }}
           
           **SIGame pack compression utility**
           
           ### Downloads
-          - **Linux**: `sicom-${{ steps.get_version.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz`
-          - **macOS (Intel)**: `sicom-${{ steps.get_version.outputs.version }}-x86_64-apple-darwin.tar.gz`  
-          - **macOS (Apple Silicon)**: `sicom-${{ steps.get_version.outputs.version }}-aarch64-apple-darwin.tar.gz`
-          - **Windows**: `sicom-${{ steps.get_version.outputs.version }}-x86_64-pc-windows-msvc.zip`
+          - **Linux**: \`sicom-${{ steps.get_version.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz\`
+          - **macOS (Intel)**: \`sicom-${{ steps.get_version.outputs.version }}-x86_64-apple-darwin.tar.gz\`  
+          - **macOS (Apple Silicon)**: \`sicom-${{ steps.get_version.outputs.version }}-aarch64-apple-darwin.tar.gz\`
+          - **Windows**: \`sicom-${{ steps.get_version.outputs.version }}-x86_64-pc-windows-msvc.zip\`
           
           ### Installation
           1. Download the appropriate archive for your platform
-          2. Extract the `sicom` binary
+          2. Extract the \`sicom\` binary
           3. Add to your PATH or run directly
           4. Install FFmpeg for video compression support
           
           ### Usage
-          ```bash
+          \`\`\`bash
           sicom compress input.siq output.siq --image-quality 85
-          ```
+          \`\`\`
           
-          See the [README](https://github.com/bvc3at/sicom#readme) for detailed usage instructions.
-        draft: false
-        prerelease: false
+          See the [README](https://github.com/bvc3at/sicom#readme) for detailed usage instructions."
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build:
     name: Build ${{ matrix.target }}
@@ -132,11 +129,8 @@ jobs:
         Compress-Archive -Path "target/${{ matrix.target }}/release/sicom.exe" -DestinationPath "sicom-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.zip"
 
     - name: Upload Release Asset
-      uses: actions/upload-release-asset@v1
+      run: |
+        gh release upload ${{ needs.create-release.outputs.version }} \
+          ./sicom-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.${{ matrix.archive_ext }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ needs.create-release.outputs.upload_url }}
-        asset_path: ./sicom-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.${{ matrix.archive_ext }}
-        asset_name: sicom-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.${{ matrix.archive_ext }}
-        asset_content_type: application/octet-stream
