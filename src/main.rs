@@ -48,13 +48,13 @@ enum Commands {
         #[arg(help = "Path to output compressed pack (optional)")]
         output_pack: Option<PathBuf>,
 
-        #[arg(long, default_value = "85", help = "Image quality (1-100)")]
+        #[arg(long, default_value = "40", help = "Image quality (1-100)")]
         image_quality: u8,
 
         #[arg(long, default_value = "85", help = "Audio quality (1-100)")]
         audio_quality: u8,
 
-        #[arg(long, default_value = "75", help = "Video quality (1-100)")]
+        #[arg(long, default_value = "50", help = "Video quality (1-100)")]
         video_quality: u8,
 
         #[arg(long, help = "Skip video compression")]
