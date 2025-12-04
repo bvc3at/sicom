@@ -359,7 +359,7 @@ fn compress_pack(
                     if compressed_size >= original_size && !always_compress {
                         // Keep original file since compressed version is larger
                         zip_writer
-                            .start_file(&file_name, zip::write::FileOptions::default())
+                            .start_file::<_, ()>(&file_name, zip::write::FileOptions::default())
                             .with_context(|| {
                                 format!("Failed to start file in output ZIP: {file_name}")
                             })?;
@@ -380,7 +380,7 @@ fn compress_pack(
 
                         // Add compressed image to output ZIP with WebP extension
                         zip_writer
-                            .start_file(&webp_filename, zip::write::FileOptions::default())
+                            .start_file::<_, ()>(&webp_filename, zip::write::FileOptions::default())
                             .with_context(|| {
                                 format!("Failed to start file in output ZIP: {webp_filename}")
                             })?;
@@ -418,7 +418,7 @@ fn compress_pack(
 
                     // Copy original file unchanged (keep original extension)
                     zip_writer
-                        .start_file(&file_name, zip::write::FileOptions::default())
+                        .start_file::<_, ()>(&file_name, zip::write::FileOptions::default())
                         .with_context(|| {
                             format!("Failed to start file in output ZIP: {file_name}")
                         })?;
@@ -443,7 +443,7 @@ fn compress_pack(
 
             // Copy original file unchanged (keep original extension)
             zip_writer
-                .start_file(&file_name, zip::write::FileOptions::default())
+                .start_file::<_, ()>(&file_name, zip::write::FileOptions::default())
                 .with_context(|| format!("Failed to start file in output ZIP: {file_name}"))?;
             zip_writer
                 .write_all(&image_data)
@@ -467,7 +467,7 @@ fn compress_pack(
                     if compressed_size >= original_size && !always_compress {
                         // Keep original file since compressed version is larger
                         zip_writer
-                            .start_file(&file_name, zip::write::FileOptions::default())
+                            .start_file::<_, ()>(&file_name, zip::write::FileOptions::default())
                             .with_context(|| {
                                 format!("Failed to start file in output ZIP: {file_name}")
                             })?;
@@ -483,7 +483,7 @@ fn compress_pack(
                     } else {
                         // Use compressed version (either smaller or always_compress is set)
                         zip_writer
-                            .start_file(&file_name, zip::write::FileOptions::default())
+                            .start_file::<_, ()>(&file_name, zip::write::FileOptions::default())
                             .with_context(|| {
                                 format!("Failed to start file in output ZIP: {file_name}")
                             })?;
@@ -518,7 +518,7 @@ fn compress_pack(
 
                     // Copy original file unchanged
                     zip_writer
-                        .start_file(&file_name, zip::write::FileOptions::default())
+                        .start_file::<_, ()>(&file_name, zip::write::FileOptions::default())
                         .with_context(|| {
                             format!("Failed to start file in output ZIP: {file_name}")
                         })?;
@@ -539,7 +539,7 @@ fn compress_pack(
 
             // Copy original file unchanged
             zip_writer
-                .start_file(&file_name, zip::write::FileOptions::default())
+                .start_file::<_, ()>(&file_name, zip::write::FileOptions::default())
                 .with_context(|| format!("Failed to start file in output ZIP: {file_name}"))?;
             zip_writer
                 .write_all(&audio_data)
@@ -562,7 +562,7 @@ fn compress_pack(
 
                 // Copy original file unchanged
                 zip_writer
-                    .start_file(&file_name, zip::write::FileOptions::default())
+                    .start_file::<_, ()>(&file_name, zip::write::FileOptions::default())
                     .with_context(|| format!("Failed to start file in output ZIP: {file_name}"))?;
                 zip_writer
                     .write_all(&video_data)
@@ -588,7 +588,7 @@ fn compress_pack(
                         if compressed_size >= original_size && !always_compress {
                             // Keep original file since compressed version is larger
                             zip_writer
-                                .start_file(&file_name, zip::write::FileOptions::default())
+                                .start_file::<_, ()>(&file_name, zip::write::FileOptions::default())
                                 .with_context(|| {
                                     format!("Failed to start file in output ZIP: {file_name}")
                                 })?;
@@ -606,7 +606,7 @@ fn compress_pack(
                         } else {
                             // Use compressed version (either smaller or always_compress is set)
                             zip_writer
-                                .start_file(&file_name, zip::write::FileOptions::default())
+                                .start_file::<_, ()>(&file_name, zip::write::FileOptions::default())
                                 .with_context(|| {
                                     format!("Failed to start file in output ZIP: {file_name}")
                                 })?;
@@ -642,7 +642,7 @@ fn compress_pack(
 
                         // Copy original file unchanged
                         zip_writer
-                            .start_file(&file_name, zip::write::FileOptions::default())
+                            .start_file::<_, ()>(&file_name, zip::write::FileOptions::default())
                             .with_context(|| {
                                 format!("Failed to start file in output ZIP: {file_name}")
                             })?;
@@ -661,7 +661,7 @@ fn compress_pack(
                 .with_context(|| format!("Failed to read file: {file_name}"))?;
 
             zip_writer
-                .start_file(&file_name, zip::write::FileOptions::default())
+                .start_file::<_, ()>(&file_name, zip::write::FileOptions::default())
                 .with_context(|| format!("Failed to start file in output ZIP: {file_name}"))?;
             zip_writer
                 .write_all(&buffer)
@@ -763,7 +763,7 @@ fn compress_pack(
 
         // Write updated content.xml to output ZIP
         zip_writer
-            .start_file("content.xml", zip::write::FileOptions::default())
+            .start_file::<_, ()>("content.xml", zip::write::FileOptions::default())
             .with_context(|| "Failed to start content.xml in output ZIP")?;
         zip_writer
             .write_all(xml_content.as_bytes())
