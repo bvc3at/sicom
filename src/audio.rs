@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use mp3lame_encoder::{Bitrate, Builder, FlushNoGap, InterleavedPcm};
+use mp3lame_encoder::{Bitrate, Builder, FlushNoGap, InterleavedPcm, MonoPcm};
 use std::path::Path;
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
@@ -124,10 +124,10 @@ fn decode_audio_data(data: &[u8]) -> Result<(Vec<f32>, u32, u32)> {
         let packet = match format.next_packet() {
             Ok(packet) => packet,
             Err(SymphoniaError::ResetRequired) => {
-                // The track list has been changed. Re-examine it and create a new set of decoders,
-                // then restart the decode loop. This is an advanced feature that most applications
-                // do not need.
-                unimplemented!();
+                // The track list changed mid-stream. Bail out so the caller
+                // falls back to copying the original file unchanged instead of
+                // aborting the whole run.
+                return Err(anyhow!("Track list changed mid-stream (reset required)"));
             }
             Err(SymphoniaError::IoError(err)) => {
                 // The packet reader has reached EOF, or a fatal error has occurred.
@@ -266,6 +266,10 @@ fn compress_mp3_file(data: &[u8], quality: u8) -> Result<Vec<u8>> {
     // First, decode the original MP3 to get PCM data
     let (pcm_data, sample_rate, channels) = decode_audio_data(data)?;
 
+    // The decoder interleaves at most the first two channels, so the encoder
+    // must be configured accordingly even for multichannel sources.
+    let channels = channels.min(2);
+
     // Create and configure LAME encoder
     let mut builder =
         Builder::new().ok_or_else(|| anyhow!("Failed to create MP3 encoder builder"))?;
@@ -297,36 +301,25 @@ fn compress_mp3_file(data: &[u8], quality: u8) -> Result<Vec<u8>> {
         })
         .collect();
 
-    // Ensure stereo format (duplicate mono channels if needed)
-    let stereo_pcm = if channels == 1 {
-        // Mono: duplicate samples for stereo encoding
-        let mut stereo_data = Vec::with_capacity(pcm_i16.len() * 2);
-        for &sample in &pcm_i16 {
-            stereo_data.push(sample);
-            stereo_data.push(sample);
-        }
-        stereo_data
-    } else {
-        // Already stereo
-        pcm_i16
-    };
+    // The encoder was configured with the source channel count, so the PCM
+    // must keep that layout: LAME's interleaved entry point is stereo-only,
+    // and mono samples duplicated into fake stereo double the duration.
+    let pcm = pcm_i16;
 
     // Calculate required buffer size and prepare output
-    let samples_per_channel = stereo_pcm.len() / 2;
+    let channel_count = channels.max(1) as usize;
+    let samples_per_channel = pcm.len() / channel_count;
     let mp3_buffer_size = mp3lame_encoder::max_required_buffer_size(samples_per_channel);
     let mut mp3_buffer: Vec<std::mem::MaybeUninit<u8>> = Vec::with_capacity(mp3_buffer_size);
 
     // Process audio in chunks that fit the encoder's expectations
-    let chunk_size = SAMPLES_PER_FRAME * 2; // Stereo samples
+    let chunk_size = SAMPLES_PER_FRAME * channel_count;
     let mut input_pos = 0;
     let mut total_encoded = 0;
 
-    while input_pos < stereo_pcm.len() {
-        let chunk_end = std::cmp::min(input_pos + chunk_size, stereo_pcm.len());
-        let chunk = &stereo_pcm[input_pos..chunk_end];
-
-        // Create InterleavedPcm from chunk
-        let interleaved_pcm = InterleavedPcm(chunk);
+    while input_pos < pcm.len() {
+        let chunk_end = std::cmp::min(input_pos + chunk_size, pcm.len());
+        let chunk = &pcm[input_pos..chunk_end];
 
         // Reserve space and encode
         mp3_buffer.resize(
@@ -334,9 +327,12 @@ fn compress_mp3_file(data: &[u8], quality: u8) -> Result<Vec<u8>> {
             std::mem::MaybeUninit::uninit(),
         );
 
-        let encoded_size = encoder
-            .encode(interleaved_pcm, &mut mp3_buffer[total_encoded..])
-            .map_err(|e| anyhow!("Failed to encode MP3 chunk: {}", e))?;
+        let encoded_size = if channel_count == 1 {
+            encoder.encode(MonoPcm(chunk), &mut mp3_buffer[total_encoded..])
+        } else {
+            encoder.encode(InterleavedPcm(chunk), &mut mp3_buffer[total_encoded..])
+        }
+        .map_err(|e| anyhow!("Failed to encode MP3 chunk: {}", e))?;
 
         total_encoded += encoded_size;
         input_pos = chunk_end;

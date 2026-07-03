@@ -64,6 +64,18 @@ fn get_file_extension(filename: &str) -> String {
     }
 }
 
+/// Convert video filename to MP4 extension (compression always re-muxes into
+/// an MP4 container).
+///
+/// Works on the raw entry-name string: see `image::to_webp_filename`.
+pub fn to_mp4_filename(filename: &str) -> String {
+    let segment_start = filename.rfind('/').map_or(0, |pos| pos + 1);
+    match filename[segment_start..].rfind('.') {
+        Some(dot) => format!("{}.mp4", &filename[..segment_start + dot]),
+        None => format!("{filename}.mp4"),
+    }
+}
+
 /// Get FFmpeg input format string from video format
 fn get_ffmpeg_format(format: VideoFormat) -> &'static str {
     match format {
@@ -287,8 +299,12 @@ pub fn compress_video_file(
         debug!("Video metadata: frame count unavailable, using fallback progress");
     }
 
-    let output_temp = NamedTempFile::with_suffix(&file_extension)
-        .context("Failed to create temporary output file")?;
+    // Always encode into an MP4 container (ffmpeg picks the muxer from the
+    // output extension). Writing HEVC back into the source container (AVI,
+    // MKV, MOV) produces broken or unplayable files, so the caller renames
+    // the entry to .mp4.
+    let output_temp =
+        NamedTempFile::with_suffix(".mp4").context("Failed to create temporary output file")?;
     let output_path = output_temp.path().to_path_buf();
 
     // Calculate CRF from quality
@@ -314,6 +330,8 @@ pub fn compress_video_file(
             &crf.to_string(), // Quality setting
             "-preset",
             "medium", // Encoding speed vs compression trade-off
+            "-tag:v",
+            "hvc1", // HEVC fourcc required by Safari/Apple players (default hev1 is not)
             "-c:a",
             "copy", // Copy audio stream without re-encoding
             "-movflags",
@@ -367,6 +385,22 @@ pub fn compress_video_file(
         }
     }
 
+    // The event stream alone is not a reliable failure signal: a crashed or
+    // killed ffmpeg can leave a truncated output file without emitting an
+    // Error event. The exit status is authoritative.
+    let status = child.wait().context("Failed to wait for ffmpeg process")?;
+    if !status.success() {
+        return Err(anyhow!(
+            "FFmpeg exited with {}: {}",
+            status,
+            if error_message.is_empty() {
+                "unknown error"
+            } else {
+                &error_message
+            }
+        ));
+    }
+
     if has_error {
         return Err(anyhow!("FFmpeg execution failed: {}", error_message));
     }
@@ -374,6 +408,10 @@ pub fn compress_video_file(
     // Read compressed data from output file
     let compressed_data = fs::read(&output_path).context("Failed to read compressed video data")?;
     let compressed_size = compressed_data.len() as u64;
+
+    if compressed_data.is_empty() {
+        return Err(anyhow!("FFmpeg produced an empty output file"));
+    }
 
     // Clean up temporary files automatically when they go out of scope
     // Both input_temp and output_temp will be cleaned up at function end

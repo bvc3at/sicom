@@ -8,6 +8,30 @@ pub fn is_supported_image(filename: &str) -> bool {
         .is_some_and(|ext| matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png" | "webp"))
 }
 
+/// libwebp rejects dimensions above this; the `webp` crate panics on them.
+const WEBP_MAX_DIMENSION: u32 = 16383;
+
+/// True for animated WebP (VP8X animation flag) or APNG (acTL chunk):
+/// re-encoding those through a still-image pipeline would keep only the first
+/// frame.
+fn is_animated(data: &[u8]) -> bool {
+    // WebP: RIFF....WEBPVP8X, animation is bit 1 of the VP8X flags byte.
+    if data.len() > 20 && &data[0..4] == b"RIFF" && data[8..16] == *b"WEBPVP8X" {
+        return data[20] & 0x02 != 0;
+    }
+    // APNG: an acTL chunk appears before the first IDAT.
+    if data.starts_with(&[0x89, b'P', b'N', b'G']) {
+        let first_idat = data.windows(4).position(|w| w == b"IDAT");
+        let actl = data.windows(4).position(|w| w == b"acTL");
+        return match (actl, first_idat) {
+            (Some(a), Some(d)) => a < d,
+            (Some(_), None) => true,
+            _ => false,
+        };
+    }
+    false
+}
+
 pub fn compress_image_file(
     data: &[u8],
     filename: &str,
@@ -15,9 +39,23 @@ pub fn compress_image_file(
 ) -> Result<(Vec<u8>, u64, u64)> {
     let original_size = data.len() as u64;
 
+    if is_animated(data) {
+        return Err(anyhow::anyhow!(
+            "Animated image would lose its animation: {filename}"
+        ));
+    }
+
     // Load image (detect format from data, not extension)
     let img = image::load_from_memory(data)
         .with_context(|| format!("Failed to decode image: {filename}"))?;
+
+    if img.width() > WEBP_MAX_DIMENSION || img.height() > WEBP_MAX_DIMENSION {
+        return Err(anyhow::anyhow!(
+            "Image dimensions {}x{} exceed the WebP limit of {WEBP_MAX_DIMENSION}: {filename}",
+            img.width(),
+            img.height()
+        ));
+    }
 
     // Always convert to WebP format for maximum compression
     let compressed_data = {
@@ -45,25 +83,18 @@ pub fn compress_image_file(
     Ok((compressed_data, original_size, compressed_size))
 }
 
-/// Convert image filename to WebP extension
+/// Convert image filename to WebP extension.
+///
+/// ZIP entry names are plain '/'-separated strings, so this works on the
+/// string directly: `std::path::Path` would reinterpret separators
+/// platform-dependently (e.g. '\\' on Windows), changing more than the
+/// extension.
 pub fn to_webp_filename(filename: &str) -> String {
-    let path = Path::new(filename);
-    path.file_stem().and_then(|s| s.to_str()).map_or_else(
-        || filename.to_string(),
-        |stem| {
-            path.parent().map_or_else(
-                || format!("{stem}.webp"),
-                |parent| {
-                    if parent == Path::new("") {
-                        // Handle case where there's no directory
-                        format!("{stem}.webp")
-                    } else {
-                        format!("{}/{}.webp", parent.display(), stem)
-                    }
-                },
-            )
-        },
-    )
+    let segment_start = filename.rfind('/').map_or(0, |pos| pos + 1);
+    match filename[segment_start..].rfind('.') {
+        Some(dot) => format!("{}.webp", &filename[..segment_start + dot]),
+        None => format!("{filename}.webp"),
+    }
 }
 
 #[cfg(test)]

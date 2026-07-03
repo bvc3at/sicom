@@ -1,22 +1,25 @@
 #![allow(clippy::collapsible_if)]
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use indicatif::MultiProgress;
 use indicatif_log_bridge::LogWrapper;
 use log::{debug, error, info, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, Write};
 use std::path::PathBuf;
 use thiserror::Error;
 use zip::{ZipArchive, ZipWriter};
 
 mod audio;
+mod content_xml;
 mod image;
 mod progress;
 mod stats;
 mod video;
+
+use content_xml::Category;
 
 use progress::{ProgressLogger, get_log_color_with_module};
 use stats::CompressionStats;
@@ -193,6 +196,152 @@ fn main() {
     }
 }
 
+/// Removes a partially written file unless disarmed.
+struct TempFileGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Copies entry `index` into the output without recompressing, preserving the
+/// original compression method and data byte-for-byte. Returns the
+/// uncompressed size.
+fn raw_copy_entry<R: Read + Seek, W: Write + Seek>(
+    archive: &mut ZipArchive<R>,
+    writer: &mut ZipWriter<W>,
+    index: usize,
+) -> Result<u64> {
+    let file = archive
+        .by_index_raw(index)
+        .with_context(|| format!("Failed to read file at index {index}"))?;
+    let size = file.size();
+    let name = file.name().to_string();
+    writer
+        .raw_copy_file(file)
+        .with_context(|| format!("Failed to copy file to output ZIP: {name}"))?;
+    Ok(size)
+}
+
+/// Plans which entries may be renamed (extension swapped) during conversion.
+///
+/// A rename is disqualified when the target name — raw or URL-decoded — would
+/// collide with an existing entry or another planned target, or when several
+/// entries URL-decode to the same name (SIGame resolves references against
+/// URL-decoded entry names, so decoded collisions shadow files just like raw
+/// ones). Disqualified files keep their original name and bytes.
+fn plan_renames(
+    entry_names: &[String],
+    allowed: bool,
+    target_for: impl Fn(&str) -> Option<String>,
+) -> HashMap<String, String> {
+    if !allowed {
+        return HashMap::new();
+    }
+
+    let mut decoded_counts: HashMap<String, usize> = HashMap::new();
+    for name in entry_names {
+        *decoded_counts
+            .entry(content_xml::unescape_data_string(name))
+            .or_default() += 1;
+    }
+
+    let candidates: Vec<(String, String)> = entry_names
+        .iter()
+        .filter_map(|name| target_for(name).map(|target| (name.clone(), target)))
+        .filter(|(name, target)| name != target)
+        .collect();
+
+    let mut target_counts: HashMap<String, usize> = HashMap::new();
+    let mut target_decoded_counts: HashMap<String, usize> = HashMap::new();
+    for (_, target) in &candidates {
+        *target_counts.entry(target.clone()).or_default() += 1;
+        *target_decoded_counts
+            .entry(content_xml::unescape_data_string(target))
+            .or_default() += 1;
+    }
+
+    let existing: HashSet<&String> = entry_names.iter().collect();
+
+    candidates
+        .into_iter()
+        .filter(|(name, target)| {
+            let target_decoded = content_xml::unescape_data_string(target);
+            let ok = target_counts[target] == 1
+                && target_decoded_counts[&target_decoded] == 1
+                && !existing.contains(target)
+                && !decoded_counts.contains_key(&target_decoded)
+                && decoded_counts[&content_xml::unescape_data_string(name)] == 1;
+            if !ok {
+                warn!(
+                    "Not converting {name}: the new name {target} would collide with another file"
+                );
+            }
+            ok
+        })
+        .collect()
+}
+
+/// Records a rename for the content.xml update, keyed the way SIGame resolves
+/// references: by URL-decoded file name without the category directory.
+fn record_conversion(
+    conversions: &mut HashMap<Category, HashMap<String, String>>,
+    category: Category,
+    old_name: &str,
+    new_name: &str,
+) {
+    let strip = |name: &str| {
+        content_xml::unescape_data_string(name.strip_prefix(category.dir_prefix()).unwrap_or(name))
+    };
+    conversions
+        .entry(category)
+        .or_default()
+        .insert(strip(old_name), strip(new_name));
+}
+
+/// Adds `<Default Extension=... />` declarations to [Content_Types].xml for
+/// extensions introduced by conversion. Modern SIGame ignores this file, but
+/// legacy OPC-based readers hide entries with undeclared extensions.
+fn add_content_type_defaults(
+    content_types: &str,
+    conversions: &HashMap<Category, HashMap<String, String>>,
+) -> String {
+    let lower = content_types.to_lowercase();
+    let mut additions = String::new();
+
+    let converted_any = |category: Category| {
+        conversions
+            .get(&category)
+            .is_some_and(|renames| !renames.is_empty())
+    };
+
+    if converted_any(Category::Images) && !lower.contains("extension=\"webp\"") {
+        additions.push_str("<Default Extension=\"webp\" ContentType=\"si/image\" />");
+    }
+    if converted_any(Category::Video) && !lower.contains("extension=\"mp4\"") {
+        additions.push_str("<Default Extension=\"mp4\" ContentType=\"si/video\" />");
+    }
+
+    if additions.is_empty() {
+        return content_types.to_string();
+    }
+    match content_types.rfind("</Types>") {
+        Some(pos) => format!(
+            "{}{}{}",
+            &content_types[..pos],
+            additions,
+            &content_types[pos..]
+        ),
+        None => content_types.to_string(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compress_pack(
     input_pack: PathBuf,
@@ -287,17 +436,68 @@ fn compress_pack(
     let mut archive = ZipArchive::new(BufReader::new(input_file))
         .with_context(|| "Failed to read ZIP archive")?;
 
-    // Create output ZIP
-    let output_file = File::create(&output_path)
-        .with_context(|| format!("Failed to create output file: {output_path:?}"))?;
+    // --- Pre-pass: read content.xml and plan renames before writing anything ---
+
+    let content_xml_data: Option<String> = match archive.by_name("content.xml") {
+        Ok(mut file) => {
+            let mut xml_data = String::new();
+            file.read_to_string(&mut xml_data)
+                .with_context(|| "Failed to read content.xml as UTF-8")?;
+            Some(xml_data)
+        }
+        Err(zip::result::ZipError::FileNotFound) => None,
+        Err(e) => return Err(e).with_context(|| "Failed to open content.xml"),
+    };
+
+    // Renaming a file is only safe when its references in content.xml can be
+    // rewritten. A missing or unparseable content.xml therefore disables every
+    // rename (media is still recompressed in place where possible).
+    let renames_allowed = match content_xml_data.as_deref() {
+        Some(xml) => match content_xml::find_media_refs(xml) {
+            Ok(_) => true,
+            Err(e) => {
+                warn!("content.xml cannot be safely rewritten ({e}); files will keep their names");
+                false
+            }
+        },
+        None => {
+            warn!("No content.xml found in pack; files will keep their names");
+            false
+        }
+    };
+
+    let entry_names: Vec<String> = archive.file_names().map(String::from).collect();
+
+    let planned_images = plan_renames(&entry_names, renames_allowed && !skip_image, |name| {
+        (name.starts_with("Images/") && image::is_supported_image(name))
+            .then(|| image::to_webp_filename(name))
+    });
+    let planned_videos = plan_renames(
+        &entry_names,
+        renames_allowed && !skip_video && ffmpeg_available,
+        |name| {
+            (name.starts_with("Video/") && video::is_supported_video(name))
+                .then(|| video::to_mp4_filename(name))
+        },
+    );
+
+    // Write to a temporary file next to the output and rename into place at
+    // the end: a failed run never leaves a partial .siq behind, and
+    // compressing onto the input path cannot destroy the input.
+    let part_path = output_path.with_extension("siq.part");
+    let output_file = File::create(&part_path)
+        .with_context(|| format!("Failed to create output file: {part_path:?}"))?;
     let mut zip_writer = ZipWriter::new(BufWriter::new(output_file));
 
     // Statistics tracking
     let mut stats = CompressionStats::new();
 
-    // Track image conversions for content.xml updates
-    let mut image_conversions: HashMap<String, String> = HashMap::new();
-    let mut content_xml_data: Option<String> = None;
+    // URL-decoded old name -> new name (without the category dir prefix),
+    // per category, for content.xml updates.
+    let mut conversions: HashMap<Category, HashMap<String, String>> = HashMap::new();
+    // Every entry name written to the output, for final validation.
+    let mut written_names: Vec<String> = Vec::new();
+    let mut content_types_data: Option<String> = None;
 
     // Initialize progress logger
     let total_files = archive.len() as u64;
@@ -320,65 +520,69 @@ fn compress_pack(
             .to_string()
     }
 
+    // Remove the partial output file unless the run completes.
+    let mut part_guard = TempFileGuard {
+        path: part_path.clone(),
+        armed: true,
+    };
+
     // Process each file in the archive
     for i in 0..archive.len() {
-        let mut file = archive
-            .by_index(i)
-            .with_context(|| format!("Failed to read file at index {i}"))?;
+        let file_name = {
+            archive
+                .by_index_raw(i)
+                .with_context(|| format!("Failed to read file at index {i}"))?
+                .name()
+                .to_string()
+        };
 
-        let file_name = file.name().to_string();
         let is_image = file_name.starts_with("Images/") && image::is_supported_image(&file_name);
         let is_audio = file_name.starts_with("Audio/") && audio::is_supported_audio(&file_name);
         let is_video = file_name.starts_with("Video/") && video::is_supported_video(&file_name);
-        let is_content_xml = file_name == "content.xml";
 
         debug!("Processing: {file_name}");
 
-        if is_content_xml {
-            // Read content.xml for later processing
-            let mut xml_data = String::new();
-            file.read_to_string(&mut xml_data)
-                .with_context(|| "Failed to read content.xml as UTF-8")?;
-
-            // Track input size
-            stats.add_other_file(xml_data.len() as u64);
-
-            content_xml_data = Some(xml_data);
-
-            // We'll write content.xml after processing all images
-            debug!("  Stored content.xml for path updates");
+        if file_name == "content.xml" && content_xml_data.is_some() {
+            // Rewritten and written after the loop.
+            debug!("  Deferred content.xml for reference updates");
+        } else if file_name == "[Content_Types].xml" && content_types_data.is_none() {
+            let mut data = Vec::new();
+            archive
+                .by_index(i)
+                .with_context(|| format!("Failed to read file at index {i}"))?
+                .read_to_end(&mut data)
+                .with_context(|| "Failed to read [Content_Types].xml")?;
+            match String::from_utf8(data) {
+                // Written after the loop, possibly with added type declarations.
+                Ok(text) => content_types_data = Some(text),
+                Err(e) => {
+                    let size = raw_copy_entry(&mut archive, &mut zip_writer, i)?;
+                    written_names.push(file_name.clone());
+                    stats.add_other_file(size);
+                    debug!("  [Content_Types].xml is not UTF-8 ({e}); copied unchanged");
+                }
+            }
         } else if is_image && !skip_image {
-            // Read image data
-            let mut image_data = Vec::new();
-            file.read_to_end(&mut image_data)
-                .with_context(|| format!("Failed to read image data: {file_name}"))?;
+            // Renaming to .webp is only allowed when planned (no collisions,
+            // rewritable content.xml). Files already named .webp are
+            // recompressed in place.
+            let target = planned_images.get(&file_name).cloned().or_else(|| {
+                let same = image::to_webp_filename(&file_name);
+                (same == file_name).then_some(same)
+            });
 
-            match image::compress_image_file(&image_data, &file_name, image_quality) {
-                Ok((compressed_data, original_size, compressed_size)) => {
-                    // Check if compression actually reduced size
-                    if compressed_size >= original_size && !always_compress {
-                        // Keep original file since compressed version is larger
-                        zip_writer
-                            .start_file(&file_name, zip::write::FileOptions::default())
-                            .with_context(|| {
-                                format!("Failed to start file in output ZIP: {file_name}")
-                            })?;
-                        zip_writer.write_all(&image_data).with_context(|| {
-                            format!("Failed to write original image: {file_name}")
-                        })?;
+            if let Some(webp_filename) = target {
+                let mut image_data = Vec::new();
+                archive
+                    .by_index(i)
+                    .with_context(|| format!("Failed to read file at index {i}"))?
+                    .read_to_end(&mut image_data)
+                    .with_context(|| format!("Failed to read image data: {file_name}"))?;
 
-                        stats.add_kept_original_image(original_size);
-
-                        info!(
-                            "  Keeping original (compressed would be larger): {original_size} bytes vs {compressed_size} bytes"
-                        );
-
-                        // Do NOT track this conversion - content.xml will keep original path
-                    } else {
-                        // Use compressed version (either smaller or always_compress is set)
-                        let webp_filename = image::to_webp_filename(&file_name);
-
-                        // Add compressed image to output ZIP with WebP extension
+                match image::compress_image_file(&image_data, &file_name, image_quality) {
+                    Ok((compressed_data, original_size, compressed_size))
+                        if compressed_size < original_size || always_compress =>
+                    {
                         zip_writer
                             .start_file(&webp_filename, zip::write::FileOptions::default())
                             .with_context(|| {
@@ -387,9 +591,16 @@ fn compress_pack(
                         zip_writer.write_all(&compressed_data).with_context(|| {
                             format!("Failed to write compressed image: {webp_filename}")
                         })?;
+                        written_names.push(webp_filename.clone());
 
-                        // Track the conversion for content.xml updates
-                        image_conversions.insert(file_name.clone(), webp_filename.clone());
+                        if webp_filename != file_name {
+                            record_conversion(
+                                &mut conversions,
+                                Category::Images,
+                                &file_name,
+                                &webp_filename,
+                            );
+                        }
 
                         stats.add_processed_image(original_size, compressed_size);
 
@@ -412,145 +623,101 @@ fn compress_pack(
                             );
                         }
                     }
-                }
-                Err(e) => {
-                    debug!("  Skipping {file_name}: {e}");
-
-                    // Copy original file unchanged (keep original extension)
-                    zip_writer
-                        .start_file(&file_name, zip::write::FileOptions::default())
-                        .with_context(|| {
-                            format!("Failed to start file in output ZIP: {file_name}")
-                        })?;
-                    zip_writer
-                        .write_all(&image_data)
-                        .with_context(|| format!("Failed to write original file: {file_name}"))?;
-
-                    stats.add_skipped_image(image_data.len() as u64);
-
-                    // Do NOT track this conversion - content.xml will keep original path
-                }
-            }
-        } else if is_image && skip_image {
-            // Skip image compression - copy original file unchanged
-            let mut image_data = Vec::new();
-            file.read_to_end(&mut image_data)
-                .with_context(|| format!("Failed to read image data: {file_name}"))?;
-
-            // Input size will be tracked by stats methods
-
-            debug!("  Skipping image compression (skip_image flag): {file_name}");
-
-            // Copy original file unchanged (keep original extension)
-            zip_writer
-                .start_file(&file_name, zip::write::FileOptions::default())
-                .with_context(|| format!("Failed to start file in output ZIP: {file_name}"))?;
-            zip_writer
-                .write_all(&image_data)
-                .with_context(|| format!("Failed to write original image: {file_name}"))?;
-
-            stats.add_skipped_image(image_data.len() as u64);
-
-            // Do NOT track this conversion - content.xml will keep original path
-        } else if is_audio && !skip_audio {
-            // Read audio data
-            let mut audio_data = Vec::new();
-            file.read_to_end(&mut audio_data)
-                .with_context(|| format!("Failed to read audio data: {file_name}"))?;
-
-            // Track input size
-
-            // Try to compress audio
-            match audio::compress_audio_file(&audio_data, &file_name, audio_quality) {
-                Ok((compressed_data, original_size, compressed_size)) => {
-                    // Check if compression actually reduced size
-                    if compressed_size >= original_size && !always_compress {
+                    Ok((_, original_size, compressed_size)) => {
                         // Keep original file since compressed version is larger
-                        zip_writer
-                            .start_file(&file_name, zip::write::FileOptions::default())
-                            .with_context(|| {
-                                format!("Failed to start file in output ZIP: {file_name}")
-                            })?;
-                        zip_writer.write_all(&audio_data).with_context(|| {
-                            format!("Failed to write original audio: {file_name}")
-                        })?;
-
-                        stats.add_kept_original_audio(original_size);
-
+                        raw_copy_entry(&mut archive, &mut zip_writer, i)?;
+                        written_names.push(file_name.clone());
+                        stats.add_kept_original_image(original_size);
                         info!(
                             "  Keeping original (compressed would be larger): {original_size} bytes vs {compressed_size} bytes"
                         );
-                    } else {
-                        // Use compressed version (either smaller or always_compress is set)
-                        zip_writer
-                            .start_file(&file_name, zip::write::FileOptions::default())
-                            .with_context(|| {
-                                format!("Failed to start file in output ZIP: {file_name}")
-                            })?;
-                        zip_writer.write_all(&compressed_data).with_context(|| {
-                            format!("Failed to write compressed audio: {file_name}")
-                        })?;
-
-                        stats.add_processed_audio(original_size, compressed_size);
-
-                        let display_filename = get_display_filename(&file_name);
-                        if compressed_size >= original_size {
-                            debug!(
-                                "  Compressed \"{}\" to MP3 (forced): {} bytes -> {} bytes ({:.1}% increase)",
-                                display_filename,
-                                original_size,
-                                compressed_size,
-                                (compressed_size as f64 / original_size as f64 - 1.0) * 100.0
-                            );
-                        } else {
-                            debug!(
-                                "  Compressed \"{}\" to MP3: {} bytes -> {} bytes ({:.1}% reduction)",
-                                display_filename,
-                                original_size,
-                                compressed_size,
-                                (1.0 - compressed_size as f64 / original_size as f64) * 100.0
-                            );
-                        }
+                    }
+                    Err(e) => {
+                        debug!("  Skipping {file_name}: {e}");
+                        let size = raw_copy_entry(&mut archive, &mut zip_writer, i)?;
+                        written_names.push(file_name.clone());
+                        stats.add_skipped_image(size);
                     }
                 }
-                Err(e) => {
-                    debug!("  Skipping {file_name}: {e}");
+            } else {
+                // Rename disqualified: keep the original bytes so the
+                // references in content.xml stay valid.
+                debug!("  Keeping original (renaming is not safe here): {file_name}");
+                let size = raw_copy_entry(&mut archive, &mut zip_writer, i)?;
+                written_names.push(file_name.clone());
+                stats.add_skipped_image(size);
+            }
+        } else if is_image {
+            debug!("  Skipping image compression (skip_image flag): {file_name}");
+            let size = raw_copy_entry(&mut archive, &mut zip_writer, i)?;
+            written_names.push(file_name.clone());
+            stats.add_skipped_image(size);
+        } else if is_audio && !skip_audio {
+            let mut audio_data = Vec::new();
+            archive
+                .by_index(i)
+                .with_context(|| format!("Failed to read file at index {i}"))?
+                .read_to_end(&mut audio_data)
+                .with_context(|| format!("Failed to read audio data: {file_name}"))?;
 
-                    // Copy original file unchanged
+            match audio::compress_audio_file(&audio_data, &file_name, audio_quality) {
+                Ok((compressed_data, original_size, compressed_size))
+                    if compressed_size < original_size || always_compress =>
+                {
                     zip_writer
                         .start_file(&file_name, zip::write::FileOptions::default())
                         .with_context(|| {
                             format!("Failed to start file in output ZIP: {file_name}")
                         })?;
-                    zip_writer.write_all(&audio_data).with_context(|| {
-                        format!("Failed to write original audio file: {file_name}")
+                    zip_writer.write_all(&compressed_data).with_context(|| {
+                        format!("Failed to write compressed audio: {file_name}")
                     })?;
+                    written_names.push(file_name.clone());
 
-                    stats.add_skipped_audio(audio_data.len() as u64);
+                    stats.add_processed_audio(original_size, compressed_size);
+
+                    let display_filename = get_display_filename(&file_name);
+                    if compressed_size >= original_size {
+                        debug!(
+                            "  Compressed \"{}\" to MP3 (forced): {} bytes -> {} bytes ({:.1}% increase)",
+                            display_filename,
+                            original_size,
+                            compressed_size,
+                            (compressed_size as f64 / original_size as f64 - 1.0) * 100.0
+                        );
+                    } else {
+                        debug!(
+                            "  Compressed \"{}\" to MP3: {} bytes -> {} bytes ({:.1}% reduction)",
+                            display_filename,
+                            original_size,
+                            compressed_size,
+                            (1.0 - compressed_size as f64 / original_size as f64) * 100.0
+                        );
+                    }
+                }
+                Ok((_, original_size, compressed_size)) => {
+                    raw_copy_entry(&mut archive, &mut zip_writer, i)?;
+                    written_names.push(file_name.clone());
+                    stats.add_kept_original_audio(original_size);
+                    info!(
+                        "  Keeping original (compressed would be larger): {original_size} bytes vs {compressed_size} bytes"
+                    );
+                }
+                Err(e) => {
+                    debug!("  Skipping {file_name}: {e}");
+                    let size = raw_copy_entry(&mut archive, &mut zip_writer, i)?;
+                    written_names.push(file_name.clone());
+                    stats.add_skipped_audio(size);
                 }
             }
-        } else if is_audio && skip_audio {
-            // Skip audio compression - copy original file unchanged
-            let mut audio_data = Vec::new();
-            file.read_to_end(&mut audio_data)
-                .with_context(|| format!("Failed to read audio data: {file_name}"))?;
-
+        } else if is_audio {
             debug!("  Skipping audio compression (skip_audio flag): {file_name}");
-
-            // Copy original file unchanged
-            zip_writer
-                .start_file(&file_name, zip::write::FileOptions::default())
-                .with_context(|| format!("Failed to start file in output ZIP: {file_name}"))?;
-            zip_writer
-                .write_all(&audio_data)
-                .with_context(|| format!("Failed to write original audio file: {file_name}"))?;
-
-            stats.add_skipped_audio(audio_data.len() as u64);
+            let size = raw_copy_entry(&mut archive, &mut zip_writer, i)?;
+            written_names.push(file_name.clone());
+            stats.add_skipped_audio(size);
         } else if is_video {
-            // Read video data
-            let mut video_data = Vec::new();
-            file.read_to_end(&mut video_data)
-                .with_context(|| format!("Failed to read video data: {file_name}"))?;
+            let is_mp4 = file_name.to_lowercase().ends_with(".mp4");
+            let target = planned_videos.get(&file_name).cloned();
 
             if skip_video || !ffmpeg_available {
                 let reason = if skip_video {
@@ -559,17 +726,26 @@ fn compress_pack(
                     "ffmpeg not available"
                 };
                 debug!("  Skipping video compression ({reason}): {file_name}");
-
-                // Copy original file unchanged
-                zip_writer
-                    .start_file(&file_name, zip::write::FileOptions::default())
-                    .with_context(|| format!("Failed to start file in output ZIP: {file_name}"))?;
-                zip_writer
-                    .write_all(&video_data)
-                    .with_context(|| format!("Failed to write original video file: {file_name}"))?;
-
-                stats.add_skipped_video(video_data.len() as u64);
+                let size = raw_copy_entry(&mut archive, &mut zip_writer, i)?;
+                written_names.push(file_name.clone());
+                stats.add_skipped_video(size);
+            } else if target.is_none() && !is_mp4 {
+                // Compression re-muxes into MP4; without a safe rename the
+                // extension would lie about the container. Keep the original.
+                debug!("  Keeping original (renaming to .mp4 is not safe here): {file_name}");
+                let size = raw_copy_entry(&mut archive, &mut zip_writer, i)?;
+                written_names.push(file_name.clone());
+                stats.add_skipped_video(size);
             } else {
+                let mp4_filename = target.unwrap_or_else(|| file_name.clone());
+
+                let mut video_data = Vec::new();
+                archive
+                    .by_index(i)
+                    .with_context(|| format!("Failed to read file at index {i}"))?
+                    .read_to_end(&mut video_data)
+                    .with_context(|| format!("Failed to read video data: {file_name}"))?;
+
                 // Try to compress video using ffmpeg-sidecar
                 logger.start_video_progress(&file_name, &multi_progress);
                 let video_result = video::compress_video_file(
@@ -579,208 +755,146 @@ fn compress_pack(
                     ffmpeg_path.as_deref(),
                     &mut logger,
                 );
+                logger.finish_video_progress();
 
                 match video_result {
-                    Ok((compressed_data, original_size, compressed_size)) => {
-                        logger.finish_video_progress();
-
-                        // Check if compression actually reduced size
-                        if compressed_size >= original_size && !always_compress {
-                            // Keep original file since compressed version is larger
-                            zip_writer
-                                .start_file(&file_name, zip::write::FileOptions::default())
-                                .with_context(|| {
-                                    format!("Failed to start file in output ZIP: {file_name}")
-                                })?;
-                            zip_writer.write_all(&video_data).with_context(|| {
-                                format!("Failed to write original video: {file_name}")
+                    Ok((compressed_data, original_size, compressed_size))
+                        if compressed_size < original_size || always_compress =>
+                    {
+                        zip_writer
+                            .start_file(&mp4_filename, zip::write::FileOptions::default())
+                            .with_context(|| {
+                                format!("Failed to start file in output ZIP: {mp4_filename}")
                             })?;
+                        zip_writer.write_all(&compressed_data).with_context(|| {
+                            format!("Failed to write compressed video: {mp4_filename}")
+                        })?;
+                        written_names.push(mp4_filename.clone());
 
-                            stats.add_kept_original_video(original_size);
+                        if mp4_filename != file_name {
+                            record_conversion(
+                                &mut conversions,
+                                Category::Video,
+                                &file_name,
+                                &mp4_filename,
+                            );
+                        }
 
-                            info!(
-                                "  Keeping original (compressed would be larger): {} vs {}",
+                        stats.add_processed_video(original_size, compressed_size);
+
+                        let display_filename = get_display_filename(&file_name);
+                        if compressed_size >= original_size {
+                            debug!(
+                                "  Compressed \"{}\" to HEVC (forced): {} -> {} ({:.1}% increase)",
+                                display_filename,
                                 format_size(original_size),
-                                format_size(compressed_size)
+                                format_size(compressed_size),
+                                (compressed_size as f64 / original_size as f64 - 1.0) * 100.0
                             );
                         } else {
-                            // Use compressed version (either smaller or always_compress is set)
-                            zip_writer
-                                .start_file(&file_name, zip::write::FileOptions::default())
-                                .with_context(|| {
-                                    format!("Failed to start file in output ZIP: {file_name}")
-                                })?;
-                            zip_writer.write_all(&compressed_data).with_context(|| {
-                                format!("Failed to write compressed video: {file_name}")
-                            })?;
-
-                            stats.add_processed_video(original_size, compressed_size);
-
-                            let display_filename = get_display_filename(&file_name);
-                            if compressed_size >= original_size {
-                                debug!(
-                                    "  Compressed \"{}\" to HEVC (forced): {} -> {} ({:.1}% increase)",
-                                    display_filename,
-                                    format_size(original_size),
-                                    format_size(compressed_size),
-                                    (compressed_size as f64 / original_size as f64 - 1.0) * 100.0
-                                );
-                            } else {
-                                debug!(
-                                    "  Compressed \"{}\" to HEVC: {} -> {} ({:.1}% reduction)",
-                                    display_filename,
-                                    format_size(original_size),
-                                    format_size(compressed_size),
-                                    (1.0 - compressed_size as f64 / original_size as f64) * 100.0
-                                );
-                            }
+                            debug!(
+                                "  Compressed \"{}\" to HEVC: {} -> {} ({:.1}% reduction)",
+                                display_filename,
+                                format_size(original_size),
+                                format_size(compressed_size),
+                                (1.0 - compressed_size as f64 / original_size as f64) * 100.0
+                            );
                         }
                     }
+                    Ok((_, original_size, compressed_size)) => {
+                        raw_copy_entry(&mut archive, &mut zip_writer, i)?;
+                        written_names.push(file_name.clone());
+                        stats.add_kept_original_video(original_size);
+                        info!(
+                            "  Keeping original (compressed would be larger): {} vs {}",
+                            format_size(original_size),
+                            format_size(compressed_size)
+                        );
+                    }
                     Err(e) => {
-                        logger.finish_video_progress(); // Cleanup on error
                         warn!("  Video compression failed for {file_name}: {e}");
-
-                        // Copy original file unchanged
-                        zip_writer
-                            .start_file(&file_name, zip::write::FileOptions::default())
-                            .with_context(|| {
-                                format!("Failed to start file in output ZIP: {file_name}")
-                            })?;
-                        zip_writer.write_all(&video_data).with_context(|| {
-                            format!("Failed to write original video file: {file_name}")
-                        })?;
-
-                        stats.add_skipped_video(video_data.len() as u64);
+                        let size = raw_copy_entry(&mut archive, &mut zip_writer, i)?;
+                        written_names.push(file_name.clone());
+                        stats.add_skipped_video(size);
                     }
                 }
             }
         } else {
-            // Copy other files unchanged
-            let mut buffer = Vec::new();
-            file.read_to_end(&mut buffer)
-                .with_context(|| format!("Failed to read file: {file_name}"))?;
-
-            zip_writer
-                .start_file(&file_name, zip::write::FileOptions::default())
-                .with_context(|| format!("Failed to start file in output ZIP: {file_name}"))?;
-            zip_writer
-                .write_all(&buffer)
-                .with_context(|| format!("Failed to write file: {file_name}"))?;
-
-            stats.add_other_file(buffer.len() as u64);
+            // Copy other files unchanged, preserving their compression and
+            // metadata byte-for-byte.
+            let size = raw_copy_entry(&mut archive, &mut zip_writer, i)?;
+            written_names.push(file_name.clone());
+            stats.add_other_file(size);
         }
 
         // Increment progress after processing each file
         logger.inc();
     }
 
-    // Process content.xml with updated image paths
-    if let Some(mut xml_content) = content_xml_data {
-        info!("Updating content.xml with new image paths");
+    // Write content.xml with references updated for the renamed files.
+    if let Some(xml_content) = content_xml_data {
+        stats.add_other_file(xml_content.len() as u64);
+        info!("Updating content.xml media references");
 
-        let mut updated_refs = 0;
+        let (new_xml, updated_refs) = content_xml::rewrite_media_refs(&xml_content, &conversions)
+            .with_context(|| "Failed to rewrite content.xml")?;
 
-        // Update image paths in content.xml
-        for (original_path, webp_path) in &image_conversions {
-            // Extract just the filename from the full path for the XML replacement
-            let original_filename = original_path
-                .strip_prefix("Images/")
-                .unwrap_or(original_path);
-            let webp_filename = webp_path.strip_prefix("Images/").unwrap_or(webp_path);
-
-            // Try different encoding variations of the filename
-            let original_variations = vec![
-                original_filename.to_string(),
-                urlencoding::decode(original_filename)
-                    .unwrap_or_else(|_| original_filename.into())
-                    .to_string(),
-                urlencoding::encode(original_filename).to_string(),
-            ];
-
-            let webp_variations = vec![
-                webp_filename.to_string(),
-                urlencoding::decode(webp_filename)
-                    .unwrap_or_else(|_| webp_filename.into())
-                    .to_string(),
-                urlencoding::encode(webp_filename).to_string(),
-            ];
-
-            let mut file_replacements = 0;
-
-            // Try all combinations of original and webp variations
-            for orig_var in &original_variations {
-                for webp_var in &webp_variations {
-                    // Try different XML patterns that might contain the filename
-                    let patterns = vec![
-                        // Simple filename reference
-                        (orig_var.clone(), webp_var.clone()),
-                        // With isRef="True" wrapper
-                        (
-                            format!("isRef=\"True\">{orig_var}"),
-                            format!("isRef=\"True\">{webp_var}"),
-                        ),
-                        // With type="image" attribute
-                        (
-                            format!("type=\"image\" isRef=\"True\">{orig_var}"),
-                            format!("type=\"image\" isRef=\"True\">{webp_var}"),
-                        ),
-                        // With different quote styles
-                        (
-                            format!("isRef='True'>{orig_var}"),
-                            format!("isRef='True'>{webp_var}"),
-                        ),
-                        // Full path references
-                        (format!("Images/{orig_var}"), format!("Images/{webp_var}")),
-                        // Path references with isRef
-                        (
-                            format!("isRef=\"True\">Images/{orig_var}"),
-                            format!("isRef=\"True\">Images/{webp_var}"),
-                        ),
-                    ];
-
-                    for (old_pattern, new_pattern) in patterns {
-                        if old_pattern != new_pattern {
-                            let count = xml_content.matches(&old_pattern).count();
-                            if count > 0 {
-                                xml_content = xml_content.replace(&old_pattern, &new_pattern);
-                                file_replacements += count;
-                            }
-                        }
-                    }
-                }
-            }
-
-            updated_refs += file_replacements;
-
-            if file_replacements > 0 {
-                debug!(
-                    "  Updated: {original_filename} -> {webp_filename} ({file_replacements} refs)"
-                );
-            } else {
-                warn!("  Warning: No refs found for {original_filename}");
-            }
+        // Final safety net: every reference that resolved against the input
+        // pack must still resolve against the output pack. Refusing to write
+        // beats writing a corrupted pack; this can only trip on a bug.
+        let mut final_names = written_names.clone();
+        final_names.push("content.xml".to_string());
+        if content_types_data.is_some() {
+            final_names.push("[Content_Types].xml".to_string());
+        }
+        let broken_before: HashSet<String> =
+            content_xml::unresolved_refs(&xml_content, &entry_names)?
+                .into_iter()
+                .collect();
+        let regressions: Vec<String> = content_xml::unresolved_refs(&new_xml, &final_names)?
+            .into_iter()
+            .filter(|r| !broken_before.contains(r))
+            .collect();
+        if !regressions.is_empty() {
+            bail!(
+                "Refusing to write output: media references would break: {}",
+                regressions.join(", ")
+            );
         }
 
-        // Write updated content.xml to output ZIP
         zip_writer
             .start_file("content.xml", zip::write::FileOptions::default())
             .with_context(|| "Failed to start content.xml in output ZIP")?;
         zip_writer
-            .write_all(xml_content.as_bytes())
+            .write_all(new_xml.as_bytes())
             .with_context(|| "Failed to write updated content.xml")?;
 
-        // Track updated refs and file size
+        #[allow(clippy::cast_possible_truncation)]
         stats.add_updated_refs(updated_refs as u32);
-        // Note: content.xml size was already tracked when we read it
 
-        warn!("Updated {updated_refs} image references in content.xml");
-    } else {
-        warn!("Warning: No content.xml found in pack");
+        info!("Updated {updated_refs} media references in content.xml");
+    }
+
+    // Write [Content_Types].xml, declaring types for newly introduced
+    // extensions so legacy OPC-based readers keep seeing the renamed files.
+    if let Some(content_types) = content_types_data {
+        stats.add_other_file(content_types.len() as u64);
+        let content_types = add_content_type_defaults(&content_types, &conversions);
+        zip_writer
+            .start_file("[Content_Types].xml", zip::write::FileOptions::default())
+            .with_context(|| "Failed to start [Content_Types].xml in output ZIP")?;
+        zip_writer
+            .write_all(content_types.as_bytes())
+            .with_context(|| "Failed to write [Content_Types].xml")?;
     }
 
     zip_writer
         .finish()
         .with_context(|| "Failed to finalize output ZIP")?;
+
+    std::fs::rename(&part_path, &output_path)
+        .with_context(|| format!("Failed to move output into place: {output_path:?}"))?;
+    part_guard.armed = false;
 
     // Finish progress logging and show final summary
     logger.finish();
@@ -1073,5 +1187,114 @@ mod tests {
         let temp_path = temp_file.path().with_extension("siq");
         std::fs::copy(temp_file.path(), &temp_path).unwrap();
         temp_path
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        let img = ::image::RgbaImage::from_fn(32, 32, |x, y| {
+            ::image::Rgba([(x * 8) as u8, (y * 8) as u8, 128, 255])
+        });
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, ::image::ImageFormat::Png).unwrap();
+        buf.into_inner()
+    }
+
+    /// End-to-end guard against the historical corruption bugs: adversarial
+    /// file names must never produce dangling references or altered text.
+    #[test]
+    fn test_compress_pack_rewrites_refs_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        let input_path = dir.path().join("input.siq");
+        let output_path = dir.path().join("output.siq");
+
+        let xml = "\u{feff}<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+<package name=\"t\" version=\"5\" logo=\"@logo one.png\"><rounds><round name=\"r\"><themes><theme name=\"t\"><questions>\
+<question price=\"100\"><scenario>\
+<item type=\"image\" isRef=\"True\">1.png</item>\
+<item type=\"image\" isRef=\"True\">11.png</item>\
+<item>Look at 1.png carefully</item>\
+<item type=\"image\" isRef=\"True\">a&amp;b.png</item>\
+<item type=\"image\" isRef=\"True\">pic.png</item>\
+<item type=\"image\" isRef=\"True\">pic.jpg</item>\
+<item type=\"image\">https://example.com/1.png</item>\
+</scenario></question>\
+</questions></theme></themes></round></rounds></package>";
+
+        {
+            let file = File::create(&input_path).unwrap();
+            let mut writer = ZipWriter::new(BufWriter::new(file));
+            let options = zip::write::FileOptions::default();
+            writer.start_file("content.xml", options).unwrap();
+            writer.write_all(xml.as_bytes()).unwrap();
+            for name in [
+                "Images/1.png",
+                "Images/11.png",
+                "Images/a&b.png",
+                "Images/pic.png",
+                "Images/pic.jpg",
+                // Real-world convention: entry name Uri-escaped, XML literal.
+                "Images/logo%20one.png",
+            ] {
+                writer.start_file(name, options).unwrap();
+                writer.write_all(&tiny_png()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+
+        compress_pack(
+            input_path,
+            Some(output_path.clone()),
+            40,
+            85,
+            50,
+            false, // images on
+            true,  // skip audio
+            true,  // skip video
+            None,
+            true, // always compress: force renames even if webp is larger
+            MultiProgress::new(),
+        )
+        .unwrap();
+
+        let file = File::open(&output_path).unwrap();
+        let mut archive = ZipArchive::new(BufReader::new(file)).unwrap();
+        let names: Vec<String> = archive.file_names().map(String::from).collect();
+
+        // Renamed cleanly, preserving percent-encoding in the entry name.
+        for expected in [
+            "Images/1.webp",
+            "Images/11.webp",
+            "Images/a&b.webp",
+            "Images/logo%20one.webp",
+        ] {
+            assert!(names.contains(&expected.to_string()), "missing {expected}");
+        }
+        // The stem collision pair must keep its original names and bytes.
+        assert!(names.contains(&"Images/pic.png".to_string()));
+        assert!(names.contains(&"Images/pic.jpg".to_string()));
+        assert!(!names.contains(&"Images/pic.webp".to_string()));
+
+        let mut xml_out = String::new();
+        archive
+            .by_name("content.xml")
+            .unwrap()
+            .read_to_string(&mut xml_out)
+            .unwrap();
+
+        assert!(xml_out.contains(">1.webp</item>"));
+        assert!(xml_out.contains(">11.webp</item>"));
+        assert!(xml_out.contains(">a&amp;b.webp</item>"));
+        assert!(xml_out.contains("logo=\"@logo one.webp\""));
+        // Untouched: question text, external URL, collision-disqualified refs.
+        assert!(xml_out.contains("Look at 1.png carefully"));
+        assert!(xml_out.contains("https://example.com/1.png"));
+        assert!(xml_out.contains(">pic.png</item>"));
+        assert!(xml_out.contains(">pic.jpg</item>"));
+
+        // Every reference must resolve exactly as SIGame would resolve it.
+        assert!(
+            content_xml::unresolved_refs(&xml_out, &names)
+                .unwrap()
+                .is_empty()
+        );
     }
 }
