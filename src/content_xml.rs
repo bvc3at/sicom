@@ -160,7 +160,10 @@ pub fn find_media_refs(xml: &str) -> Result<Vec<MediaRef>> {
                         context = attr_value(e, b"type")?
                             .as_deref()
                             .and_then(Category::from_media_type)
-                            .map(|category| RefContext { category, needs_at: true });
+                            .map(|category| RefContext {
+                                category,
+                                needs_at: true,
+                            });
                     }
                     b"item" => {
                         let is_ref = attr_value(e, b"isRef")?
@@ -169,7 +172,10 @@ pub fn find_media_refs(xml: &str) -> Result<Vec<MediaRef>> {
                             context = attr_value(e, b"type")?
                                 .as_deref()
                                 .and_then(Category::from_media_type)
-                                .map(|category| RefContext { category, needs_at: false });
+                                .map(|category| RefContext {
+                                    category,
+                                    needs_at: false,
+                                });
                         }
                     }
                     b"package" => {
@@ -177,9 +183,10 @@ pub fn find_media_refs(xml: &str) -> Result<Vec<MediaRef>> {
                             if let Some(link) = logo.strip_prefix('@') {
                                 if !link.is_empty() {
                                     let tag = &doc[prev_pos..cur_pos];
-                                    let value_span = find_logo_value_span(tag).ok_or_else(
-                                        || anyhow!("cannot locate logo attribute value"),
-                                    )?;
+                                    let value_span =
+                                        find_logo_value_span(tag).ok_or_else(|| {
+                                            anyhow!("cannot locate logo attribute value")
+                                        })?;
                                     refs.push(MediaRef {
                                         // +1 skips the '@'
                                         span: prev_pos + value_span.start + 1
@@ -214,7 +221,9 @@ pub fn find_media_refs(xml: &str) -> Result<Vec<MediaRef>> {
                 // A comment between the start tag and the text is fine: the
                 // run has not begun, keep the context.
             }
-            Event::End(_) | Event::Empty(_) => finalize_run(doc, &mut context, &mut run, &mut refs)?,
+            Event::End(_) | Event::Empty(_) => {
+                finalize_run(doc, &mut context, &mut run, &mut refs)?
+            }
             Event::Eof => {
                 finalize_run(doc, &mut context, &mut run, &mut refs)?;
                 break;
@@ -244,10 +253,7 @@ fn find_logo_value_span(tag: &str) -> Option<Range<usize>> {
                 }
                 i += 1;
             }
-            b'l' if tag[i..].starts_with("logo")
-                && i > 0
-                && bytes[i - 1].is_ascii_whitespace() =>
-            {
+            b'l' if tag[i..].starts_with("logo") && i > 0 && bytes[i - 1].is_ascii_whitespace() => {
                 let mut j = i + 4;
                 while j < bytes.len() && bytes[j].is_ascii_whitespace() {
                     j += 1;
@@ -472,7 +478,8 @@ mod tests {
 
     #[test]
     fn rewrite_updates_logo_and_atoms_preserving_at() {
-        let conversions = image_conversions(&[("logo.jpg", "logo.webp"), ("pic one.jpg", "pic one.webp")]);
+        let conversions =
+            image_conversions(&[("logo.jpg", "logo.webp"), ("pic one.jpg", "pic one.webp")]);
         let (out, count) = rewrite_media_refs(V4_XML, &conversions).unwrap();
         assert_eq!(count, 2);
         assert!(out.contains("logo=\"@logo.webp\""));
