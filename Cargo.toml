@@ -26,6 +26,6 @@ indicatif-log-bridge = "0.2"
 quick-xml = "0.41.0"
 
 [dependencies.tempfile]
-version = "3.22"
+version = "3.23"
 
 [dev-dependencies]
